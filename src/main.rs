@@ -1,10 +1,14 @@
+use sqlx::Postgres;
 use std::collections::HashMap;
+use std::io::Write;
 use std::process::{Child, Command, Stdio};
 
 use actix_cors::Cors;
 use actix_web::http::header::{ContentDisposition, DispositionType};
 use actix_web::{get, web, App, Either, HttpRequest, HttpResponse, HttpServer, Responder};
 use serde::{Deserialize, Serialize};
+use sqlx::pool::Pool;
+use sqlx::postgres::PgPoolOptions;
 use tracing::{error, Level};
 use tracing_subscriber::FmtSubscriber;
 
@@ -14,7 +18,14 @@ struct Directories {
     months: Option<Months>,
 }
 
-type Months = HashMap<String, Option<Vec<String>>>;
+#[derive(Serialize, Debug)]
+
+struct File {
+    file: String,
+    comment: Option<String>,
+}
+
+type Months = HashMap<String, Option<Vec<File>>>;
 
 #[get("/{guild_id}")]
 async fn get_years_dir(_path: web::Path<String>) -> impl Responder {
@@ -184,7 +195,10 @@ async fn get_current_month(path: web::Path<String>) -> impl Responder {
 
                     for entry in entries {
                         if let Ok(entry) = entry {
-                            let file_name = entry.file_name().to_str().unwrap().to_owned();
+                            let file_name = File {
+                                file: entry.file_name().to_str().unwrap().to_owned(),
+                                comment: None,
+                            };
                             dirs.months
                                 .as_mut()
                                 .unwrap()
@@ -237,10 +251,12 @@ async fn get_audio(
 struct StartEnd {
     start: Option<f32>,
     end: Option<f32>,
+    name: Option<String>,
 }
 
 #[get("/download/{guild_id}/{year}/{month}/{file_name}")]
 async fn download_audio(
+    pool: web::Data<Pool<Postgres>>,
     _req: HttpRequest,
     path: web::Path<(u64, i32, String, String)>,
     clip_duration: web::Query<StartEnd>,
@@ -264,9 +280,11 @@ async fn download_audio(
         .await;
 
         let output = child.wait_with_output().unwrap();
+        let (user_id, _) = file_name.split_once('-').expect("expected valid string");
 
         // println!("Result: {:?}", &output.stdout);
         // println!("Error: {}", String::from_utf8(output.stderr).unwrap());
+        save_bytes_to_file(output.stdout.clone(), pool, user_id, file_name).await;
 
         Either::Left(
             HttpResponse::Ok()
@@ -290,6 +308,54 @@ async fn download_audio(
     }
 }
 
+async fn save_bytes_to_file(
+    bytes: Vec<u8>,
+    pool: web::Data<Pool<Postgres>>,
+    user_id: &str,
+    file_name: &str,
+) {
+    let path = format!("/home/tulipan/projects/FBI-agent/clips/{}", "file_name.ogg");
+    let mut command = match Command::new("ffmpeg")
+        // override file
+        .arg("-y")
+        // input
+        .args(["-i", "-"])
+        .args(["-c:v", "copy"])
+        .args(["-c:a", "copy"])
+        // since we pipe the output we have to tell ffmpeg whats its gonna be
+        .args(["-f", "ogg"])
+        .arg(path)
+        // output to file
+        // .arg(&file_path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(result) => result,
+        Err(err) => {
+            panic!("error: {}", err);
+        }
+    };
+
+    let stdin = command.stdin.as_mut().unwrap();
+    stdin.write_all(&bytes).expect("could not write to stdin");
+
+    let output = command.wait_with_output();
+
+    println!("output = {:?}", output);
+
+    let result = sqlx::query!(
+        "INSERT INTO favorites (user_id, clip_name) VALUES ($1, $2) ON CONFLICT (user_id) DO NOTHING",
+        user_id.parse::<i64>().unwrap(),
+        user_id
+    )
+    .execute(pool.get_ref())
+    .await
+    .unwrap();
+}
+
+// TODO: save it to a file as well
 async fn crop_ffmpeg(start: f32, end: f32, file_name: &str) -> Child {
     let command = match Command::new("ffmpeg")
         // seek to
@@ -324,8 +390,23 @@ async fn not_found() -> impl Responder {
     HttpResponse::NotFound().json("not found")
 }
 
+#[get("/test")]
+async fn test1(pool: web::Data<Pool<Postgres>>) -> impl Responder {
+    let result = sqlx::query!("select * from favorites")
+        .fetch_all(pool.get_ref())
+        .await;
+    println!("{:#?}", result);
+    HttpResponse::Ok().json("no")
+}
+
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
+    let pool = PgPoolOptions::new()
+        .max_connections(5)
+        .connect("postgres://postgres:okcpli4t94@localhost/sakiot_rouvas")
+        .await
+        .expect("cannot connect to database");
+
     let subscriber = FmtSubscriber::builder()
         // .with_thread_names(true)
         // .with_file(true)
@@ -340,16 +421,18 @@ async fn main() -> std::io::Result<()> {
 
     tracing::subscriber::set_global_default(subscriber).expect("setting default subscriber failed");
 
-    HttpServer::new(|| {
+    HttpServer::new(move || {
         let test = web::scope("/get")
             .service(get_years_dir)
             .service(get_months_dir)
             .service(get_recording_for_month);
         App::new()
+            .app_data(web::Data::new(pool.clone()))
             .service(test)
             .service(get_current_month)
             .service(get_audio)
             .service(download_audio)
+            .service(test1)
             .default_service(web::route().to(not_found))
             .wrap(
                 Cors::default()
