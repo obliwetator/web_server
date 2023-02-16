@@ -1,15 +1,30 @@
+mod auth;
+mod clips;
+mod grpc;
+mod jwt_numeric_date;
+mod user;
+
+use actix_web::body::EitherBody;
+use actix_web::middleware::Logger;
+use auth::{discord_login, get_token, ACCESS_SECRET, REFRESH_SECRET};
+use clips::{get_clip, get_clips, play_clip};
+use jsonwebtoken::{DecodingKey, EncodingKey};
 use sqlx::Postgres;
 use std::collections::HashMap;
 use std::io::Write;
 use std::process::{Child, Command, Stdio};
+use tonic::transport::Server;
+use user::{get_current_user, get_current_user_guilds};
 
 use actix_cors::Cors;
 use actix_web::http::header::{ContentDisposition, DispositionType};
-use actix_web::{get, web, App, Either, HttpRequest, HttpResponse, HttpServer, Responder};
+use actix_web::{
+    get, web, App, Either, HttpMessage, HttpRequest, HttpResponse, HttpServer, Responder,
+};
 use serde::{Deserialize, Serialize};
 use sqlx::pool::Pool;
 use sqlx::postgres::PgPoolOptions;
-use tracing::{error, Level};
+use tracing::{error, info, Level};
 use tracing_subscriber::FmtSubscriber;
 
 #[derive(Serialize, Debug)]
@@ -25,7 +40,15 @@ struct File {
     comment: Option<String>,
 }
 
+#[derive(Debug)]
+enum DBErrors {
+    Unknown,
+    UniqueViolation,
+}
+
 type Months = HashMap<String, Option<Vec<File>>>;
+pub const RECORDING_PATH: &str = "/home/tulipan/projects/FBI-agent/voice_recordings/";
+pub const CLIPS_PATH: &str = "/home/tulipan/projects/FBI-agent/clips/";
 
 #[get("/{guild_id}")]
 async fn get_years_dir(_path: web::Path<String>) -> impl Responder {
@@ -258,45 +281,90 @@ struct StartEnd {
 async fn download_audio(
     pool: web::Data<Pool<Postgres>>,
     _req: HttpRequest,
-    path: web::Path<(u64, i32, String, String)>,
+    path: web::Path<(i64, i32, String, String)>,
     clip_duration: web::Query<StartEnd>,
 ) -> Either<HttpResponse, actix_files::NamedFile> {
     let path = path.into_inner();
     let guild_id = &path.0;
     let year = &path.1;
     let month = &path.2;
-    let file_name = &path.3;
+    let file_name_from_url = &path.3;
 
-    let file_path = format!(
-        "/home/tulipan/projects/FBI-agent/voice_recordings/{}/{}/{}/{}",
-        guild_id, year, month, file_name
-    );
+    info!("{:#?}", clip_duration);
+
+    let file_name_without_guild_id = format!("{}/{}/{}", year, month, file_name_from_url);
     if clip_duration.end.is_some() && clip_duration.start.is_some() {
+        // Clip
         let child = crop_ffmpeg(
             clip_duration.start.unwrap(),
             clip_duration.end.unwrap(),
-            &file_path,
+            format!(
+                "{}{}/{}",
+                RECORDING_PATH, guild_id, &file_name_without_guild_id
+            )
+            .as_str(),
         )
         .await;
 
-        let output = child.wait_with_output().unwrap();
-        let (user_id, _) = file_name.split_once('-').expect("expected valid string");
+        // Check if the user provided a name. Otherwise use the file name
+        let clip_name = if clip_duration.name.is_some() {
+            clip_duration.name.as_ref().unwrap()
+        } else {
+            &file_name_without_guild_id
+        };
 
+        let output = child.wait_with_output().unwrap();
+        // TODO: use the user id of the person who clipped it
+        // Needs to implement a login system first
+        let (user_id, _) = file_name_from_url
+            .split_once('-')
+            .expect("expected valid string");
         // println!("Result: {:?}", &output.stdout);
         // println!("Error: {}", String::from_utf8(output.stderr).unwrap());
-        save_bytes_to_file(output.stdout.clone(), pool, user_id, file_name).await;
+        match save_bytes_to_file(
+            output.stdout.clone(),
+            pool,
+            user_id,
+            clip_name,
+            &file_name_without_guild_id,
+            guild_id,
+            &clip_duration,
+        )
+        .await
+        {
+            Ok(_) => {}
+            Err(_) => return Either::Left(HttpResponse::BadRequest().body("duplicate")),
+        };
 
         Either::Left(
             HttpResponse::Ok()
                 // tell the browser what type of file it is
                 .content_type("audio/ogg")
                 // tell the browser to download the file
-                .append_header(("content-disposition", "attachment;"))
+                .append_header((
+                    "content-disposition",
+                    format!("attachment; filename=\"{clip_name}.ogg\""),
+                ))
                 // send the bytes
                 .body(output.stdout),
         )
     } else {
-        let file = actix_files::NamedFile::open(&file_path).unwrap();
+        // Download full file
+        info!(
+            "file_paht: {:#?}",
+            format!(
+                "{}{}/{}",
+                RECORDING_PATH, guild_id, &file_name_without_guild_id
+            )
+        );
+        let file = actix_files::NamedFile::open(
+            format!(
+                "{}{}/{}",
+                RECORDING_PATH, guild_id, &file_name_without_guild_id
+            )
+            .as_str(),
+        )
+        .unwrap();
 
         Either::Right(
             file.use_last_modified(true)
@@ -312,9 +380,13 @@ async fn save_bytes_to_file(
     bytes: Vec<u8>,
     pool: web::Data<Pool<Postgres>>,
     user_id: &str,
+    clip_name: &str,
     file_name: &str,
-) {
-    let path = format!("/home/tulipan/projects/FBI-agent/clips/{}", "file_name.ogg");
+    guild_id: &i64,
+    clip_duration: &web::Query<StartEnd>,
+) -> Result<(), DBErrors> {
+    let path = format!("{}{}.ogg", CLIPS_PATH, clip_name);
+    info!(path);
     let mut command = match Command::new("ffmpeg")
         // override file
         .arg("-y")
@@ -328,8 +400,8 @@ async fn save_bytes_to_file(
         // output to file
         // .arg(&file_path)
         .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .spawn()
     {
         Ok(result) => result,
@@ -343,25 +415,41 @@ async fn save_bytes_to_file(
 
     let output = command.wait_with_output();
 
-    println!("output = {:?}", output);
+    info!("output = {:?}", output);
 
-    let result = sqlx::query!(
-        "INSERT INTO favorites (user_id, clip_name) VALUES ($1, $2) ON CONFLICT (user_id) DO NOTHING",
-        user_id.parse::<i64>().unwrap(),
-        user_id
-    )
-    .execute(pool.get_ref())
-    .await
-    .unwrap();
+    let result = match sqlx::query!(
+			"INSERT INTO favorites (user_id, clip_name, file_name, clip_start, clip_end, guild_id) VALUES ($1, $2, $3, $4, $5, $6)",
+			user_id.parse::<i64>().unwrap(),
+			clip_name,
+			file_name,
+			clip_duration.start.unwrap(),
+			clip_duration.end.unwrap(),
+			guild_id
+		)
+		.execute(pool.get_ref())
+		.await {
+		Ok(_) => {Ok(())},
+		Err(err) => {
+			let db_error = err.as_database_error().unwrap().code().unwrap();
+			error!("TODO: send response back: {}", db_error);
+			match db_error.as_ref() {
+				"23505" => {Err(DBErrors::UniqueViolation)}
+				_ => {Err(DBErrors::Unknown)}
+			}
+
+		},
+	};
+
+    result
 }
 
 // TODO: save it to a file as well
-async fn crop_ffmpeg(start: f32, end: f32, file_name: &str) -> Child {
+async fn crop_ffmpeg(start: f32, end: f32, file_path: &str) -> Child {
     let command = match Command::new("ffmpeg")
         // seek to
         .args(["-ss", &start.to_string()])
         // input
-        .args(["-i", file_name])
+        .args(["-i", file_path])
         // length
         .args(["-t", &end.to_string()])
         // copy the codec
@@ -390,17 +478,19 @@ async fn not_found() -> impl Responder {
     HttpResponse::NotFound().json("not found")
 }
 
-#[get("/test")]
-async fn test1(pool: web::Data<Pool<Postgres>>) -> impl Responder {
-    let result = sqlx::query!("select * from favorites")
-        .fetch_all(pool.get_ref())
-        .await;
-    println!("{:#?}", result);
-    HttpResponse::Ok().json("no")
+pub struct AccessKeys {
+    pub access_encode: EncodingKey,
+    pub refresh_encode: EncodingKey,
+    pub access_decode: DecodingKey,
+    pub refresh_decode: DecodingKey,
 }
 
 #[actix_web::main]
-async fn main() -> std::io::Result<()> {
+async fn main() {
+    // std::env::set_var("RUST_LOG", "debug");
+    // std::env::set_var("RUST_BACKTRACE", "1");
+    env_logger::init();
+
     let pool = PgPoolOptions::new()
         .max_connections(5)
         .connect("postgres://postgres:okcpli4t94@localhost/sakiot_rouvas")
@@ -421,24 +511,44 @@ async fn main() -> std::io::Result<()> {
 
     tracing::subscriber::set_global_default(subscriber).expect("setting default subscriber failed");
 
-    HttpServer::new(move || {
-        let test = web::scope("/get")
+    let b = HttpServer::new(move || {
+        let logger = Logger::default();
+        // Create the singing keys once. reuse them for every encode/decode
+        let keys = AccessKeys {
+            access_encode: EncodingKey::from_secret(ACCESS_SECRET.as_bytes()),
+            refresh_encode: EncodingKey::from_secret(REFRESH_SECRET.as_bytes()),
+            access_decode: DecodingKey::from_secret(ACCESS_SECRET.as_bytes()),
+            refresh_decode: DecodingKey::from_secret(REFRESH_SECRET.as_bytes()),
+        };
+        let get_scope = web::scope("/get")
             .service(get_years_dir)
             .service(get_months_dir)
             .service(get_recording_for_month);
+        let api_scope = web::scope("/api")
+            .wrap(AuthMiddleware)
+            .service(discord_login)
+            .service(get_current_user)
+            .service(get_current_user_guilds)
+            .service(get_token);
         App::new()
+            .wrap(logger)
             .app_data(web::Data::new(pool.clone()))
-            .service(test)
+            .app_data(web::Data::new(reqwest::Client::new()))
+            .service(get_scope)
+            .service(api_scope)
+            .app_data(web::Data::new(keys))
             .service(get_current_month)
             .service(get_audio)
             .service(download_audio)
-            .service(test1)
+            .service(get_clips)
+            .service(get_clip)
+            .service(play_clip)
             .default_service(web::route().to(not_found))
             .wrap(
-                Cors::default()
-                    .allow_any_origin()
-                    .allow_any_header()
-                    .allow_any_method(),
+                Cors::permissive(), // Cors::default()
+                                    //     .allow_any_origin()
+                                    //     .allow_any_header()
+                                    //     .allow_any_method(),
             )
         // .wrap_fn(|req, srv| {
         //     let fut = srv.call(req);
@@ -450,7 +560,129 @@ async fn main() -> std::io::Result<()> {
         //     }
         // })
     })
-    .bind(("127.0.0.1", 8080))?
-    .run()
-    .await
+    .bind(("127.0.0.1", 8080))
+    .unwrap()
+    .run();
+
+    let _tonic = tokio::spawn(async move {
+        let addr = "[::1]:50051".parse().unwrap();
+        let greeter = MyGreeter::default();
+
+        println!("GreeterServer listening on {}", addr);
+
+        Server::builder()
+            .add_service(GreeterServer::new(greeter))
+            .serve(addr)
+            .await
+    });
+
+    let _c = tokio::spawn(async move { b.await });
+    let _res = tokio::join!(_c, _tonic);
+}
+
+use std::future::{ready, Ready};
+
+use actix_web::{
+    dev::{forward_ready, Service, ServiceRequest, ServiceResponse, Transform},
+    Error,
+};
+use futures_util::future::LocalBoxFuture;
+
+use crate::auth::{AccessToken, RefreshToken};
+use crate::grpc::hello_world::greeter_server::GreeterServer;
+use crate::grpc::MyGreeter;
+
+// There are two steps in middleware processing.
+// 1. Middleware initialization, middleware factory gets called with
+//    next service in chain as parameter.
+// 2. Middleware's call method gets called with normal request.
+pub struct AuthMiddleware;
+
+// Middleware factory is `Transform` trait
+// `S` - type of the next service
+// `B` - type of response's body
+impl<S, B> Transform<S, ServiceRequest> for AuthMiddleware
+where
+    S: Service<ServiceRequest, Response = ServiceResponse<B>, Error = Error>,
+    S::Future: 'static,
+    B: 'static,
+{
+    type Response = ServiceResponse<EitherBody<B>>;
+    type Error = Error;
+    type InitError = ();
+    type Transform = SayHiMiddleware<S>;
+    type Future = Ready<Result<Self::Transform, Self::InitError>>;
+
+    fn new_transform(&self, service: S) -> Self::Future {
+        ready(Ok(SayHiMiddleware { service }))
+    }
+}
+
+pub struct SayHiMiddleware<S> {
+    service: S,
+}
+
+impl<S, B> Service<ServiceRequest> for SayHiMiddleware<S>
+where
+    S: Service<ServiceRequest, Response = ServiceResponse<B>, Error = Error>,
+    S::Future: 'static,
+    B: 'static,
+{
+    type Response = ServiceResponse<EitherBody<B>>;
+    type Error = Error;
+    type Future = LocalBoxFuture<'static, Result<Self::Response, Self::Error>>;
+
+    forward_ready!(service);
+
+    fn call(&self, req: ServiceRequest) -> Self::Future {
+        info!("PATH: {:#?}", req.path());
+        if req.path() == "/api/discord_login" {
+            // Dont validate the token if user is trying to login
+            let res = self.service.call(req);
+
+            Box::pin(async move {
+                // forwarded responses map to "left" body
+                res.await.map(ServiceResponse::map_into_left_body)
+            })
+        } else {
+            let headers = req.headers();
+            let cookie = match headers.get("cookie") {
+                Some(cookie) => cookie,
+                None => {
+                    let (request, _pl) = req.into_parts();
+
+                    let response = HttpResponse::Unauthorized().finish().map_into_right_body();
+                    return Box::pin(async { Ok(ServiceResponse::new(request, response)) });
+                }
+            };
+
+            let keys = req.app_data::<web::Data<AccessKeys>>().unwrap();
+
+            let (access_token, refresh_token) = get_access_and_refresh_tokens(cookie);
+
+            let decoded_access = AccessToken::decode(access_token, keys);
+            let _decoded_refresh = RefreshToken::decode(refresh_token, keys);
+
+            req.extensions_mut().insert(decoded_access);
+            let res = self.service.call(req);
+
+            Box::pin(async move {
+                // forwarded responses map to "left" body
+                res.await.map(ServiceResponse::map_into_left_body)
+            })
+        }
+    }
+}
+
+fn get_access_and_refresh_tokens(cookie: &reqwest::header::HeaderValue) -> (&str, &str) {
+    let tokens = cookie.to_str().unwrap();
+    let access_refresh: Vec<&str> = tokens.split(';').collect();
+
+    let access: Vec<&str> = access_refresh[0].split('=').collect();
+    let access_token = access[1];
+
+    let refresh: Vec<&str> = access_refresh[1].split('=').collect();
+    let refresh_token = refresh[1];
+
+    (access_token, refresh_token)
 }
