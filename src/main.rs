@@ -2,6 +2,7 @@ mod auth;
 mod clips;
 mod grpc;
 mod jwt_numeric_date;
+mod roles;
 mod user;
 
 use actix_web::body::EitherBody;
@@ -588,7 +589,7 @@ use actix_web::{
 };
 use futures_util::future::LocalBoxFuture;
 
-use crate::auth::{AccessToken, RefreshToken};
+use crate::auth::{Access, Refresh, Token};
 use crate::grpc::hello_world::greeter_server::GreeterServer;
 use crate::grpc::MyGreeter;
 
@@ -660,8 +661,8 @@ where
 
             let (access_token, refresh_token) = get_access_and_refresh_tokens(cookie);
 
-            let decoded_access = AccessToken::decode(access_token, keys);
-            let _decoded_refresh = RefreshToken::decode(refresh_token, keys);
+            let decoded_access = Token::<Access>::decode(access_token, keys);
+            let _decoded_refresh = Token::<Refresh>::decode(refresh_token, keys);
 
             req.extensions_mut().insert(decoded_access);
             let res = self.service.call(req);

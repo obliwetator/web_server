@@ -25,21 +25,30 @@ pub const ACCESS_SECRET: &str = "1708fd0a1828410128b1ed92ba688acd8a4b283e7c6d365
 pub const REFRESH_SECRET: &str = "cd33b16763bc28372f6e21779daf23b6e3334e61e790b716f23126eb1c84194da7ce9f9ef1e56365d589fb45514ce4bcbc46549f5122706e3d167648bfe4f598";
 const JWT_ACCESS_EXPIRY: i64 = 7;
 
+// trait Token {
+//     fn encode(id: i64, access_token: String, key: &EncodingKey) -> String;
+// }
+
+#[derive(Clone)]
+pub struct Access;
+#[derive(Clone)]
+pub struct Refresh;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AccessToken {
+pub struct Token<T> {
     // aud: String,         // Optional. Audience
     #[serde(with = "jwt_numeric_date")]
     pub exp: OffsetDateTime, // Required (validate_exp defaults to true in validation). Expiration time (as UTC timestamp)
     pub id: i64,
-    pub access_token: String,
+    pub token: String,
     // iat: usize,          // Optional. Issued at (as UTC timestamp)
     // iss: String,         // Optional. Issuer
     // nbf: usize,          // Optional. Not Before (as UTC timestamp)
     // sub: String,         // Optional. Subject (whom token refers to)
+    state: std::marker::PhantomData<T>,
 }
 
-// TODO: ERROR HANDLING
-impl AccessToken {
+impl Token<Access> {
     pub fn encode(id: i64, access_token: String, key: &EncodingKey) -> String {
         let iat = OffsetDateTime::now_utc();
         let exp = iat + Duration::days(JWT_ACCESS_EXPIRY);
@@ -47,7 +56,8 @@ impl AccessToken {
         let access = Self {
             exp,
             id,
-            access_token,
+            token: access_token,
+            state: std::marker::PhantomData::<Access>,
         };
         encode(&Header::default(), &access, key).unwrap()
     }
@@ -58,21 +68,7 @@ impl AccessToken {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RefreshToken {
-    // aud: String,         // Optional. Audience
-    #[serde(with = "jwt_numeric_date")]
-    pub exp: OffsetDateTime, // Required (validate_exp defaults to true in validation). Expiration time (as UTC timestamp)
-    pub id: i64,
-    pub refresh_token: String,
-    // iat: usize,          // Optional. Issued at (as UTC timestamp)
-    // iss: String,         // Optional. Issuer
-    // nbf: usize,          // Optional. Not Before (as UTC timestamp)
-    // sub: String,         // Optional. Subject (whom token refers to)
-}
-
-// TODO: ERROR HANDLING
-impl RefreshToken {
+impl Token<Refresh> {
     pub fn encode(id: i64, refresh_token: String, key: &EncodingKey) -> String {
         let iat = OffsetDateTime::now_utc();
         let exp = iat + Duration::days(JWT_ACCESS_EXPIRY);
@@ -80,7 +76,8 @@ impl RefreshToken {
         let refresh = Self {
             exp,
             id,
-            refresh_token,
+            token: refresh_token,
+            state: std::marker::PhantomData::<Refresh>,
         };
         encode(&Header::default(), &refresh, key).unwrap()
     }
@@ -246,9 +243,9 @@ async fn create_jwt_tokens(
     id: i64,
     keys: &web::Data<AccessKeys>,
 ) -> (String, String) {
-    let access_token = AccessToken::encode(id, access_token, &keys.access_encode);
+    let access_token = Token::<Access>::encode(id, access_token, &keys.access_encode);
 
-    let refresh_token = RefreshToken::encode(id, refresh_token, &keys.refresh_encode);
+    let refresh_token = Token::<Refresh>::encode(id, refresh_token, &keys.refresh_encode);
 
     (access_token, refresh_token)
 }

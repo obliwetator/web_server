@@ -1,4 +1,4 @@
-use crate::auth::{AccessToken, BASE_URL};
+use crate::auth::{Access, Token, BASE_URL};
 use actix_web::{
     get,
     web::{self, ReqData},
@@ -91,6 +91,7 @@ pub async fn insert_user_db(user: &User, pool: &web::Data<Pool<Postgres>>) {
 pub async fn insert_user_guilds_db(
     user_guilds: &Vec<UserGuilds>,
     pool: &web::Data<Pool<Postgres>>,
+
     user_id: i64,
 ) {
     // TODO: await all futures together
@@ -150,7 +151,7 @@ struct UserDataForFrontEnd {
 pub async fn get_current_user(
     _req: HttpRequest,
     pool: web::Data<Pool<Postgres>>,
-    token: Option<ReqData<AccessToken>>,
+    token: Option<ReqData<Token<Access>>>,
 ) -> impl Responder {
     let result = match sqlx::query_as!(
         UserDataForFrontEnd,
@@ -193,7 +194,7 @@ struct GuildDataForFrontEnd {
 pub async fn get_current_user_guilds(
     _req: HttpRequest,
     pool: web::Data<Pool<Postgres>>,
-    token: Option<ReqData<AccessToken>>,
+    token: Option<ReqData<Token<Access>>>,
 ) -> impl Responder {
     let result = match sqlx::query_as!(
         GuildDataForFrontEnd,
