@@ -7,6 +7,7 @@ mod user;
 
 use actix_web::body::EitherBody;
 use actix_web::middleware::Logger;
+use actix_web::web::ReqData;
 use auth::{discord_login, get_token, ACCESS_SECRET, REFRESH_SECRET};
 use clips::{get_clip, get_clips, play_clip};
 use jsonwebtoken::{DecodingKey, EncodingKey};
@@ -29,7 +30,7 @@ use tracing::{error, info, Level};
 use tracing_subscriber::FmtSubscriber;
 
 #[derive(Serialize, Debug)]
-struct Directories {
+pub struct Directories {
     year: i32,
     months: Option<Months>,
 }
@@ -39,6 +40,7 @@ struct Directories {
 struct File {
     file: String,
     comment: Option<String>,
+    channel_id: u64,
 }
 
 #[derive(Debug)]
@@ -148,8 +150,131 @@ async fn get_recording_for_month(_path: web::Path<(String, i32, String)>) -> imp
     HttpResponse::Ok().json("no")
 }
 
-#[get("/current/{guild_id}")]
-async fn get_current_month(path: web::Path<String>) -> impl Responder {
+pub async fn get_months_v2(path: web::Path<String>) -> Result<Vec<Directories>, HttpResponse> {
+    let guild_id = path.into_inner();
+
+    let mut dirs_vec = Vec::new();
+
+    let channel_ids = match std::fs::read_dir(format!(
+        "/home/tulipan/projects/FBI-agent/voice_recordings_v2/{}",
+        guild_id
+    )) {
+        Ok(ok) => ok,
+        Err(err) => {
+            error!("{}", err);
+            return Err(HttpResponse::NotFound()
+                .body("files does not exist or are innacessible to you 1\n"));
+        }
+    };
+
+    for channel_id in channel_ids {
+        if let Ok(entry) = channel_id {
+            let channel = entry
+                .file_name()
+                .to_str()
+                .unwrap()
+                .to_owned()
+                .parse::<u64>()
+                .unwrap();
+
+            let years = match std::fs::read_dir(format!(
+                "/home/tulipan/projects/FBI-agent/voice_recordings_v2/{}/{}",
+                guild_id, channel
+            )) {
+                Ok(ok) => ok,
+                Err(err) => {
+                    error!("{}", err);
+                    return Err(HttpResponse::NotFound()
+                        .body("files does not exist or are innacessible to you 2\n"));
+                }
+            };
+
+            for year in years {
+                if let Ok(entry) = year {
+                    let year_as_int = entry
+                        .file_name()
+                        .to_str()
+                        .unwrap()
+                        .to_owned()
+                        .parse::<i32>()
+                        .unwrap();
+
+                    let mut dirs = Directories {
+                        year: year_as_int,
+                        months: Some(HashMap::new()),
+                    };
+
+                    println!("{}", year_as_int);
+
+                    let months = match std::fs::read_dir(format!(
+                        "/home/tulipan/projects/FBI-agent/voice_recordings_v2/{}/{}/{}",
+                        guild_id, channel, year_as_int
+                    )) {
+                        Ok(ok) => ok,
+                        Err(err) => {
+                            error!("{}", err);
+                            return Err(HttpResponse::NotFound()
+                                .body("files does not exist or are innacessible to you 2\n"));
+                        }
+                    };
+
+                    for month in months {
+                        if let Ok(entry) = month {
+                            let month_as_string = entry.file_name().to_str().unwrap().to_owned();
+
+                            dirs.months
+                                .as_mut()
+                                .unwrap()
+                                .insert(month_as_string.to_owned(), Some(vec![]));
+
+                            let entries = match std::fs::read_dir(format!(
+                                "/home/tulipan/projects/FBI-agent/voice_recordings_v2/{}/{}/{}/{}",
+                                guild_id, channel, year_as_int, &month_as_string
+                            )) {
+                                Ok(ok) => ok,
+                                Err(err) => {
+                                    error!("{}", err);
+                                    return Err(HttpResponse::NotFound().body(
+                                        "files does not exist or are innacessible to you 3\n",
+                                    ));
+                                }
+                            };
+
+                            for entry in entries {
+                                if let Ok(entry) = entry {
+                                    let file_name = File {
+                                        file: entry.file_name().to_str().unwrap().to_owned(),
+                                        comment: None,
+                                        channel_id: channel,
+                                    };
+                                    dirs.months
+                                        .as_mut()
+                                        .unwrap()
+                                        .get_mut(&month_as_string)
+                                        .unwrap()
+                                        .as_mut()
+                                        .unwrap()
+                                        .push(file_name);
+                                } else {
+                                    println!("error for file");
+                                }
+                            }
+                        } else {
+                            println!("error for month")
+                        }
+                    }
+                    dirs_vec.push(dirs);
+                }
+            }
+        }
+    }
+
+    // let mut dirs_vec = Vec::new();
+
+    Ok(dirs_vec)
+}
+
+pub async fn get_months(path: web::Path<String>) -> Result<Vec<Directories>, HttpResponse> {
     let guild_id = path.into_inner();
 
     let years = match std::fs::read_dir(format!(
@@ -159,8 +284,8 @@ async fn get_current_month(path: web::Path<String>) -> impl Responder {
         Ok(ok) => ok,
         Err(err) => {
             error!("{}", err);
-            return HttpResponse::NotFound()
-                .body("files does not exist or are innacessible to you 1\n");
+            return Err(HttpResponse::NotFound()
+                .body("files does not exist or are innacessible to you 1\n"));
         }
     };
 
@@ -191,8 +316,8 @@ async fn get_current_month(path: web::Path<String>) -> impl Responder {
                 Ok(ok) => ok,
                 Err(err) => {
                     error!("{}", err);
-                    return HttpResponse::NotFound()
-                        .body("files does not exist or are innacessible to you 2\n");
+                    return Err(HttpResponse::NotFound()
+                        .body("files does not exist or are innacessible to you 2\n"));
                 }
             };
 
@@ -212,8 +337,8 @@ async fn get_current_month(path: web::Path<String>) -> impl Responder {
                         Ok(ok) => ok,
                         Err(err) => {
                             error!("{}", err);
-                            return HttpResponse::NotFound()
-                                .body("files does not exist or are innacessible to you 3\n");
+                            return Err(HttpResponse::NotFound()
+                                .body("files does not exist or are innacessible to you 3\n"));
                         }
                     };
 
@@ -222,6 +347,7 @@ async fn get_current_month(path: web::Path<String>) -> impl Responder {
                             let file_name = File {
                                 file: entry.file_name().to_str().unwrap().to_owned(),
                                 comment: None,
+                                channel_id: 0,
                             };
                             dirs.months
                                 .as_mut()
@@ -244,8 +370,34 @@ async fn get_current_month(path: web::Path<String>) -> impl Responder {
             println!("error for year");
         }
     }
-    println!("get_current_month");
-    HttpResponse::Ok().json(dirs_vec)
+
+    Ok(dirs_vec)
+}
+
+#[get("/current/{guild_id}")]
+async fn get_current_month(path: web::Path<String>) -> impl Responder {
+    let result = get_months_v2(path).await;
+
+    let resp = match result {
+        Ok(dirs_vec) => HttpResponse::Ok().json(dirs_vec),
+        Err(err) => err,
+    };
+
+    resp
+}
+
+async fn get_current_month_permission(
+    path: web::Path<String>,
+    token: Option<ReqData<Token<Access>>>,
+) -> impl Responder {
+    let result = get_months(path).await;
+
+    let resp = match result {
+        Ok(dirs_vec) => HttpResponse::Ok().json(dirs_vec),
+        Err(err) => err,
+    };
+
+    resp
 }
 
 #[get("/audio/{guild_id}/{year}/{month}/{file_name}")]
@@ -660,6 +812,8 @@ where
             let keys = req.app_data::<web::Data<AccessKeys>>().unwrap();
 
             let (access_token, refresh_token) = get_access_and_refresh_tokens(cookie);
+
+            info!("COOKIES: {:#?}", access_token);
 
             let decoded_access = Token::<Access>::decode(access_token, keys);
             let _decoded_refresh = Token::<Refresh>::decode(refresh_token, keys);
