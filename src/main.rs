@@ -13,6 +13,7 @@ use clips::{get_clip, get_clips, play_clip};
 use jsonwebtoken::{DecodingKey, EncodingKey};
 use sqlx::Postgres;
 use std::collections::HashMap;
+use std::fs::ReadDir;
 use std::io::Write;
 use std::process::{Child, Command, Stdio};
 use tonic::transport::Server;
@@ -36,11 +37,15 @@ pub struct Directories {
 }
 
 #[derive(Serialize, Debug)]
+pub struct Channels {
+    channel_id: String,
+    dirs: Vec<Directories>,
+}
 
+#[derive(Serialize, Debug)]
 struct File {
     file: String,
     comment: Option<String>,
-    channel_id: u64,
 }
 
 #[derive(Debug)]
@@ -150,11 +155,44 @@ async fn get_recording_for_month(_path: web::Path<(String, i32, String)>) -> imp
     HttpResponse::Ok().json("no")
 }
 
-pub async fn get_months_v2(path: web::Path<String>) -> Result<Vec<Directories>, HttpResponse> {
+#[inline]
+async fn for_entry(entries: ReadDir, channel: u64, dirs: &mut Directories, month_as_string: &str) {
+    for entry in entries {
+        if let Ok(entry) = entry {
+            let file_name = File {
+                file: entry.file_name().to_str().unwrap().to_owned(),
+                comment: None,
+            };
+            dirs.months
+                .as_mut()
+                .unwrap()
+                .get_mut(month_as_string)
+                .unwrap()
+                .as_mut()
+                .unwrap()
+                .push(file_name);
+        } else {
+            println!("error for file");
+        }
+    }
+}
+
+pub async fn get_months_v2(path: web::Path<String>) -> Result<Vec<Channels>, HttpResponse> {
     let guild_id = path.into_inner();
 
     let mut dirs_vec = Vec::new();
 
+    if let Some(value) = for_channel_ids(guild_id, &mut dirs_vec).await {
+        return value;
+    }
+
+    Ok(dirs_vec)
+}
+
+async fn for_channel_ids(
+    guild_id: String,
+    dirs_vec: &mut Vec<Channels>,
+) -> Option<Result<Vec<Channels>, HttpResponse>> {
     let channel_ids = match std::fs::read_dir(format!(
         "/home/tulipan/projects/FBI-agent/voice_recordings_v2/{}",
         guild_id
@@ -162,8 +200,8 @@ pub async fn get_months_v2(path: web::Path<String>) -> Result<Vec<Directories>, 
         Ok(ok) => ok,
         Err(err) => {
             error!("{}", err);
-            return Err(HttpResponse::NotFound()
-                .body("files does not exist or are innacessible to you 1\n"));
+            return Some(Err(HttpResponse::NotFound()
+                .body("files does not exist or are innacessible to you 1\n")));
         }
     };
 
@@ -184,94 +222,111 @@ pub async fn get_months_v2(path: web::Path<String>) -> Result<Vec<Directories>, 
                 Ok(ok) => ok,
                 Err(err) => {
                     error!("{}", err);
-                    return Err(HttpResponse::NotFound()
-                        .body("files does not exist or are innacessible to you 2\n"));
+                    return Some(Err(HttpResponse::NotFound()
+                        .body("files does not exist or are innacessible to you 2\n")));
                 }
             };
 
-            for year in years {
-                if let Ok(entry) = year {
-                    let year_as_int = entry
-                        .file_name()
-                        .to_str()
-                        .unwrap()
-                        .to_owned()
-                        .parse::<i32>()
-                        .unwrap();
+            let mut channels = Channels {
+                channel_id: channel.to_string(),
+                dirs: Vec::new(),
+            };
 
-                    let mut dirs = Directories {
-                        year: year_as_int,
-                        months: Some(HashMap::new()),
-                    };
-
-                    println!("{}", year_as_int);
-
-                    let months = match std::fs::read_dir(format!(
-                        "/home/tulipan/projects/FBI-agent/voice_recordings_v2/{}/{}/{}",
-                        guild_id, channel, year_as_int
-                    )) {
-                        Ok(ok) => ok,
-                        Err(err) => {
-                            error!("{}", err);
-                            return Err(HttpResponse::NotFound()
-                                .body("files does not exist or are innacessible to you 2\n"));
-                        }
-                    };
-
-                    for month in months {
-                        if let Ok(entry) = month {
-                            let month_as_string = entry.file_name().to_str().unwrap().to_owned();
-
-                            dirs.months
-                                .as_mut()
-                                .unwrap()
-                                .insert(month_as_string.to_owned(), Some(vec![]));
-
-                            let entries = match std::fs::read_dir(format!(
-                                "/home/tulipan/projects/FBI-agent/voice_recordings_v2/{}/{}/{}/{}",
-                                guild_id, channel, year_as_int, &month_as_string
-                            )) {
-                                Ok(ok) => ok,
-                                Err(err) => {
-                                    error!("{}", err);
-                                    return Err(HttpResponse::NotFound().body(
-                                        "files does not exist or are innacessible to you 3\n",
-                                    ));
-                                }
-                            };
-
-                            for entry in entries {
-                                if let Ok(entry) = entry {
-                                    let file_name = File {
-                                        file: entry.file_name().to_str().unwrap().to_owned(),
-                                        comment: None,
-                                        channel_id: channel,
-                                    };
-                                    dirs.months
-                                        .as_mut()
-                                        .unwrap()
-                                        .get_mut(&month_as_string)
-                                        .unwrap()
-                                        .as_mut()
-                                        .unwrap()
-                                        .push(file_name);
-                                } else {
-                                    println!("error for file");
-                                }
-                            }
-                        } else {
-                            println!("error for month")
-                        }
-                    }
-                    dirs_vec.push(dirs);
-                }
+            if let Some(value) = for_years(years, &guild_id, channel, &mut channels).await {
+                return Some(value);
             }
+
+            dirs_vec.push(channels);
         }
     }
 
-    // let mut dirs_vec = Vec::new();
+    // info!("{:#?}", dirs_vec);
 
-    Ok(dirs_vec)
+    None
+}
+
+#[inline]
+async fn for_years(
+    years: ReadDir,
+    guild_id: &String,
+    channel: u64,
+    dirs_vec: &mut Channels,
+) -> Option<Result<Vec<Channels>, HttpResponse>> {
+    for year in years {
+        if let Ok(entry) = year {
+            let year_as_int = entry
+                .file_name()
+                .to_str()
+                .unwrap()
+                .to_owned()
+                .parse::<i32>()
+                .unwrap();
+
+            let mut dirs = Directories {
+                year: year_as_int,
+                months: Some(HashMap::new()),
+            };
+
+            println!("{}", year_as_int);
+
+            let months = match std::fs::read_dir(format!(
+                "/home/tulipan/projects/FBI-agent/voice_recordings_v2/{}/{}/{}",
+                guild_id, channel, year_as_int
+            )) {
+                Ok(ok) => ok,
+                Err(err) => {
+                    error!("{}", err);
+                    return Some(Err(HttpResponse::NotFound()
+                        .body("files does not exist or are innacessible to you 2\n")));
+                }
+            };
+
+            if let Some(value) = for_months(months, &mut dirs, guild_id, channel, year_as_int).await
+            {
+                return Some(value);
+            }
+
+            dirs_vec.dirs.push(dirs);
+        }
+    }
+    None
+}
+
+#[inline]
+async fn for_months(
+    months: ReadDir,
+    dirs: &mut Directories,
+    guild_id: &String,
+    channel: u64,
+    year_as_int: i32,
+) -> Option<Result<Vec<Channels>, HttpResponse>> {
+    for month in months {
+        if let Ok(entry) = month {
+            let month_as_string = entry.file_name().to_str().unwrap().to_owned();
+
+            dirs.months
+                .as_mut()
+                .unwrap()
+                .insert(month_as_string.to_owned(), Some(vec![]));
+
+            let entries = match std::fs::read_dir(format!(
+                "/home/tulipan/projects/FBI-agent/voice_recordings_v2/{}/{}/{}/{}",
+                guild_id, channel, year_as_int, &month_as_string
+            )) {
+                Ok(ok) => ok,
+                Err(err) => {
+                    error!("{}", err);
+                    return Some(Err(HttpResponse::NotFound()
+                        .body("files does not exist or are innacessible to you 3\n")));
+                }
+            };
+
+            for_entry(entries, channel, dirs, &month_as_string).await;
+        } else {
+            println!("error for month")
+        }
+    }
+    None
 }
 
 pub async fn get_months(path: web::Path<String>) -> Result<Vec<Directories>, HttpResponse> {
@@ -347,7 +402,6 @@ pub async fn get_months(path: web::Path<String>) -> Result<Vec<Directories>, Htt
                             let file_name = File {
                                 file: entry.file_name().to_str().unwrap().to_owned(),
                                 comment: None,
-                                channel_id: 0,
                             };
                             dirs.months
                                 .as_mut()
@@ -400,21 +454,27 @@ async fn get_current_month_permission(
     resp
 }
 
-#[get("/audio/{guild_id}/{year}/{month}/{file_name}")]
+#[get("/audio/{guild_id}/{channel_id}/{year}/{month}/{file_name}")]
 async fn get_audio(
     req: HttpRequest,
-    path: web::Path<(u64, i32, String, String)>,
+    path: web::Path<(u64, String, i32, String, String)>,
 ) -> impl Responder {
     use actix_files::NamedFile;
     let path = path.into_inner();
     let guild_id = path.0;
-    let year = path.1;
-    let month = path.2;
-    let file_name = path.3;
+    let channel_id = path.1;
+    let year = path.2;
+    let month = path.3;
+    let file_name = path.4;
+
+    println!(
+        "/home/tulipan/projects/FBI-agent/voice_recordings_v2/{}/{}/{}/{}/{}",
+        guild_id, channel_id, year, month, file_name
+    );
 
     NamedFile::open_async(format!(
-        "/home/tulipan/projects/FBI-agent/voice_recordings/{}/{}/{}/{}",
-        guild_id, year, month, file_name
+        "/home/tulipan/projects/FBI-agent/voice_recordings_v2/{}/{}/{}/{}/{}",
+        guild_id, channel_id, year, month, file_name
     ))
     .await
     .unwrap()
