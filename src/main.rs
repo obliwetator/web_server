@@ -5,30 +5,29 @@ mod jwt_numeric_date;
 mod roles;
 mod user;
 
+use actix_cors::Cors;
 use actix_web::body::EitherBody;
+use actix_web::http::header::{ContentDisposition, DispositionType};
 use actix_web::middleware::Logger;
 use actix_web::web::ReqData;
+use actix_web::{
+    get, web, App, Either, HttpMessage, HttpRequest, HttpResponse, HttpServer, Responder,
+};
 use auth::{discord_login, get_token, ACCESS_SECRET, REFRESH_SECRET};
 use clips::{get_clip, get_clips, play_clip};
 use jsonwebtoken::{DecodingKey, EncodingKey};
+use serde::{Deserialize, Serialize};
+use sqlx::pool::Pool;
+use sqlx::postgres::PgPoolOptions;
 use sqlx::Postgres;
 use std::collections::HashMap;
 use std::fs::ReadDir;
 use std::io::Write;
 use std::process::{Child, Command, Stdio};
 use tonic::transport::Server;
-use user::{get_current_user, get_current_user_guilds};
-
-use actix_cors::Cors;
-use actix_web::http::header::{ContentDisposition, DispositionType};
-use actix_web::{
-    get, web, App, Either, HttpMessage, HttpRequest, HttpResponse, HttpServer, Responder,
-};
-use serde::{Deserialize, Serialize};
-use sqlx::pool::Pool;
-use sqlx::postgres::PgPoolOptions;
 use tracing::{error, info, Level};
 use tracing_subscriber::FmtSubscriber;
+use user::{get_current_user, get_current_user_guilds};
 
 #[derive(Serialize, Debug)]
 pub struct Directories {
@@ -84,7 +83,6 @@ async fn get_years_dir(_path: web::Path<String>) -> impl Responder {
     //     }
     // }
 
-    println!();
     HttpResponse::Ok().json("no")
 }
 
@@ -117,7 +115,6 @@ async fn get_months_dir(_path: web::Path<(String, i32)>) -> impl Responder {
     //     }
     // }
 
-    println!();
     HttpResponse::Ok().json("no")
 }
 
@@ -177,9 +174,7 @@ async fn for_entry(entries: ReadDir, channel: u64, dirs: &mut Directories, month
     }
 }
 
-pub async fn get_months_v2(path: web::Path<String>) -> Result<Vec<Channels>, HttpResponse> {
-    let guild_id = path.into_inner();
-
+pub async fn get_months_v2(guild_id: String) -> Result<Vec<Channels>, HttpResponse> {
     let mut dirs_vec = Vec::new();
 
     if let Some(value) = for_channel_ids(guild_id, &mut dirs_vec).await {
@@ -266,8 +261,6 @@ async fn for_years(
                 year: year_as_int,
                 months: Some(HashMap::new()),
             };
-
-            println!("{}", year_as_int);
 
             let months = match std::fs::read_dir(format!(
                 "/home/tulipan/projects/FBI-agent/voice_recordings_v2/{}/{}/{}",
@@ -429,8 +422,8 @@ pub async fn get_months(path: web::Path<String>) -> Result<Vec<Directories>, Htt
 }
 
 #[get("/current/{guild_id}")]
-async fn get_current_month(path: web::Path<String>) -> impl Responder {
-    let result = get_months_v2(path).await;
+async fn get_current_month(guild_id: String) -> impl Responder {
+    let result = get_months_v2(guild_id).await;
 
     let resp = match result {
         Ok(dirs_vec) => HttpResponse::Ok().json(dirs_vec),
@@ -440,11 +433,66 @@ async fn get_current_month(path: web::Path<String>) -> impl Responder {
     resp
 }
 
+#[get("/current/{guild_id}")]
 async fn get_current_month_permission(
     path: web::Path<String>,
     token: Option<ReqData<Token<Access>>>,
+    pool: web::Data<Pool<Postgres>>,
 ) -> impl Responder {
-    let result = get_months(path).await;
+    let token = match token {
+        Some(ok) => ok,
+        // TODO: Proper message
+        None => {
+            panic!("Token should be present")
+        }
+    };
+
+    let guild_id = path.into_inner();
+    let guild_id_as_int = guild_id.parse::<i64>().unwrap();
+
+    // Check if the user that any kind of permission for nay of the voice channels in the guild
+    let res = match sqlx::query!(
+        "SELECT channels.name,  channel_permissions.channel_id ,kind,allow,deny FROM channels
+			INNER JOIN channel_permissions
+			ON channels.channel_id = channel_permissions.channel_id
+			WHERE channel_permissions.target_id = $1
+			AND guild_id = $2
+			AND channels.type = 2",
+        token.id,
+        guild_id_as_int
+    )
+    .fetch_all(pool.get_ref())
+    .await
+    {
+        Ok(ok) => ok,
+        Err(_) => {
+            // TODO:
+            panic!("Error ")
+        }
+    };
+
+    let res2 = match sqlx::query!(
+        "SELECT * FROM user_guilds 
+			WHERE user_id = $1 
+			AND id = $2",
+        token.id,
+        guild_id_as_int
+    )
+    .fetch_one(pool.get_ref())
+    .await
+    {
+        Ok(ok) => ok,
+        Err(_) => {
+            // TODO:
+            panic!("Error ")
+        }
+    };
+
+    info!("{:#?}", res);
+
+    // sqlx::query!("SELECT channel_id, kind, allow, deny FROM channel_permissions");
+
+    let result = get_months_v2(guild_id).await;
 
     let resp = match result {
         Ok(dirs_vec) => HttpResponse::Ok().json(dirs_vec),
@@ -742,7 +790,8 @@ async fn main() {
             .service(discord_login)
             .service(get_current_user)
             .service(get_current_user_guilds)
-            .service(get_token);
+            .service(get_token)
+            .service(get_current_month_permission);
         App::new()
             .wrap(logger)
             .app_data(web::Data::new(pool.clone()))
@@ -750,7 +799,6 @@ async fn main() {
             .service(get_scope)
             .service(api_scope)
             .app_data(web::Data::new(keys))
-            .service(get_current_month)
             .service(get_audio)
             .service(download_audio)
             .service(get_clips)
