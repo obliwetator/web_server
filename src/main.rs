@@ -1,33 +1,40 @@
+mod audio;
 mod auth;
 mod clips;
+mod errors;
 mod grpc;
 mod jwt_numeric_date;
+mod permissions;
 mod roles;
 mod user;
+mod websocket;
 
-use actix_cors::Cors;
 use actix_web::body::EitherBody;
-use actix_web::http::header::{ContentDisposition, DispositionType};
 use actix_web::middleware::Logger;
 use actix_web::web::ReqData;
-use actix_web::{
-    get, web, App, Either, HttpMessage, HttpRequest, HttpResponse, HttpServer, Responder,
-};
+use audio::{download_audio, get_audio, get_waveform_data, remove_silence};
 use auth::{discord_login, get_token, ACCESS_SECRET, REFRESH_SECRET};
-use clips::{get_clip, get_clips, play_clip};
+use clips::{delete, get_clip, get_clips, play_clip};
 use jsonwebtoken::{DecodingKey, EncodingKey};
+use permissions::get_everyone_permission_for_guild;
+use sqlx::Postgres;
+use websocket::web_socket;
+
+use std::collections::{HashMap, HashSet};
+use std::fs::ReadDir;
+
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
+use tonic::transport::Server;
+use user::{get_current_user, get_current_user_guilds};
+
+use actix_cors::Cors;
+use actix_web::{get, web, App, HttpMessage, HttpResponse, HttpServer, Responder};
 use serde::{Deserialize, Serialize};
 use sqlx::pool::Pool;
 use sqlx::postgres::PgPoolOptions;
-use sqlx::Postgres;
-use std::collections::HashMap;
-use std::fs::ReadDir;
-use std::io::Write;
-use std::process::{Child, Command, Stdio};
-use tonic::transport::Server;
 use tracing::{error, info, Level};
 use tracing_subscriber::FmtSubscriber;
-use user::{get_current_user, get_current_user_guilds};
 
 #[derive(Serialize, Debug)]
 pub struct Directories {
@@ -55,105 +62,13 @@ enum DBErrors {
 
 type Months = HashMap<String, Option<Vec<File>>>;
 pub const RECORDING_PATH: &str = "/home/tulipan/projects/FBI-agent/voice_recordings/";
+pub const NO_SILENCE_RECORDING_PATH: &str =
+    "/home/tulipan/projects/FBI-agent/no_silence_voice_recordings/";
 pub const CLIPS_PATH: &str = "/home/tulipan/projects/FBI-agent/clips/";
 
-#[get("/{guild_id}")]
-async fn get_years_dir(_path: web::Path<String>) -> impl Responder {
-    // let guild_id = path.into_inner();
-    // let entries = match std::fs::read_dir(format!("../FBI-agent/voice_recordings/{}", guild_id)) {
-    //     Ok(ok) => ok,
-    //     Err(_) => {
-    //         return HttpResponse::NotFound()
-    //             .body("guild_id does not exist or is innacessible to you\n")
-    //     }
-    // };
-
-    // let mut dirs = Directories {
-    //     year: vec![(HashMap::new())],
-    // };
-
-    // for entry in entries {
-    //     if let Ok(entry) = entry {
-    //         println!("{:#?}", entry.file_name());
-
-    //         dirs.name
-    //             .push(entry.file_name().to_str().unwrap().to_owned())
-    //     } else {
-    //         println!("cannot get entry");
-    //     }
-    // }
-
-    HttpResponse::Ok().json("no")
-}
-
-#[get("/{guild_id}/{year}")]
-async fn get_months_dir(_path: web::Path<(String, i32)>) -> impl Responder {
-    // let (guild_id, year) = path.into_inner();
-    // let entries = match std::fs::read_dir(format!(
-    //     "../FBI-agent/voice_recordings/{}/{}",
-    //     guild_id, year
-    // )) {
-    //     Ok(ok) => ok,
-    //     Err(_) => {
-    //         return HttpResponse::NotFound().body("year does not exist or is innacessible to you\n")
-    //     }
-    // };
-
-    // let mut dirs = Directories {
-    //     year: 2022,
-    //     name: vec![],
-    // };
-
-    // for entry in entries {
-    //     if let Ok(entry) = entry {
-    //         println!("{:#?}", entry.file_name());
-
-    //         dirs.name
-    //             .push(entry.file_name().to_str().unwrap().to_owned())
-    //     } else {
-    //         println!("cannot get entry");
-    //     }
-    // }
-
-    HttpResponse::Ok().json("no")
-}
-
-#[get("/{guild_id}/{year}/{month}")]
-async fn get_recording_for_month(_path: web::Path<(String, i32, String)>) -> impl Responder {
-    // let (guild_id, year, month) = path.into_inner();
-    // let entries = match std::fs::read_dir(format!(
-    //     "../FBI-agent/voice_recordings/{}/{}/{}",
-    //     guild_id, year, month
-    // )) {
-    //     Ok(ok) => ok,
-    //     Err(_) => {
-    //         return HttpResponse::NotFound()
-    //             .body("files does not exist or are innacessible to you\n")
-    //     }
-    // };
-
-    // let mut dirs = Directories {
-    //     year: 2022,
-    //     name: vec![],
-    // };
-
-    // for entry in entries {
-    //     if let Ok(entry) = entry {
-    //         println!("{:#?}", entry.file_name());
-
-    //         dirs.name
-    //             .push(entry.file_name().to_str().unwrap().to_owned())
-    //     } else {
-    //         println!("cannot get entry");
-    //     }
-    // }
-
-    println!();
-    HttpResponse::Ok().json("no")
-}
 
 #[inline]
-async fn for_entry(entries: ReadDir, channel: u64, dirs: &mut Directories, month_as_string: &str) {
+async fn for_entry(entries: ReadDir, _channel: u64, dirs: &mut Directories, month_as_string: &str) {
     for entry in entries {
         if let Ok(entry) = entry {
             let file_name = File {
@@ -169,15 +84,18 @@ async fn for_entry(entries: ReadDir, channel: u64, dirs: &mut Directories, month
                 .unwrap()
                 .push(file_name);
         } else {
-            println!("error for file");
+            info!("error for file");
         }
     }
 }
 
-pub async fn get_months_v2(guild_id: String) -> Result<Vec<Channels>, HttpResponse> {
+pub async fn get_channels_dir(
+    guild_id: String,
+    channel_hashset: HashSet<i64>,
+) -> Result<Vec<Channels>, HttpResponse> {
     let mut dirs_vec = Vec::new();
 
-    if let Some(value) = for_channel_ids(guild_id, &mut dirs_vec).await {
+    if let Some(value) = for_channel_ids(guild_id, &mut dirs_vec, channel_hashset).await {
         return value;
     }
 
@@ -187,11 +105,9 @@ pub async fn get_months_v2(guild_id: String) -> Result<Vec<Channels>, HttpRespon
 async fn for_channel_ids(
     guild_id: String,
     dirs_vec: &mut Vec<Channels>,
+    channel_hashset: HashSet<i64>,
 ) -> Option<Result<Vec<Channels>, HttpResponse>> {
-    let channel_ids = match std::fs::read_dir(format!(
-        "/home/tulipan/projects/FBI-agent/voice_recordings_v2/{}",
-        guild_id
-    )) {
+    let channel_ids = match std::fs::read_dir(format!("{}{}", RECORDING_PATH, guild_id)) {
         Ok(ok) => ok,
         Err(err) => {
             error!("{}", err);
@@ -210,28 +126,31 @@ async fn for_channel_ids(
                 .parse::<u64>()
                 .unwrap();
 
-            let years = match std::fs::read_dir(format!(
-                "/home/tulipan/projects/FBI-agent/voice_recordings_v2/{}/{}",
-                guild_id, channel
-            )) {
-                Ok(ok) => ok,
-                Err(err) => {
-                    error!("{}", err);
-                    return Some(Err(HttpResponse::NotFound()
-                        .body("files does not exist or are innacessible to you 2\n")));
+            if channel_hashset.contains(&(channel as i64)) {
+                // we have the channel is the hashset. User can access this channel
+                let years = match std::fs::read_dir(format!(
+                    "{}{}/{}",
+                    RECORDING_PATH, guild_id, channel
+                )) {
+                    Ok(ok) => ok,
+                    Err(err) => {
+                        error!("{}", err);
+                        return Some(Err(HttpResponse::NotFound()
+                            .body("files does not exist or are innacessible to you 2\n")));
+                    }
+                };
+
+                let mut channels = Channels {
+                    channel_id: channel.to_string(),
+                    dirs: Vec::new(),
+                };
+
+                if let Some(value) = for_years(years, &guild_id, channel, &mut channels).await {
+                    return Some(value);
                 }
-            };
 
-            let mut channels = Channels {
-                channel_id: channel.to_string(),
-                dirs: Vec::new(),
-            };
-
-            if let Some(value) = for_years(years, &guild_id, channel, &mut channels).await {
-                return Some(value);
+                dirs_vec.push(channels);
             }
-
-            dirs_vec.push(channels);
         }
     }
 
@@ -263,8 +182,8 @@ async fn for_years(
             };
 
             let months = match std::fs::read_dir(format!(
-                "/home/tulipan/projects/FBI-agent/voice_recordings_v2/{}/{}/{}",
-                guild_id, channel, year_as_int
+                "{}{}/{}/{}",
+                RECORDING_PATH, guild_id, channel, year_as_int
             )) {
                 Ok(ok) => ok,
                 Err(err) => {
@@ -303,8 +222,8 @@ async fn for_months(
                 .insert(month_as_string.to_owned(), Some(vec![]));
 
             let entries = match std::fs::read_dir(format!(
-                "/home/tulipan/projects/FBI-agent/voice_recordings_v2/{}/{}/{}/{}",
-                guild_id, channel, year_as_int, &month_as_string
+                "{}{}/{}/{}/{}",
+                RECORDING_PATH, guild_id, channel, year_as_int, &month_as_string
             )) {
                 Ok(ok) => ok,
                 Err(err) => {
@@ -316,7 +235,7 @@ async fn for_months(
 
             for_entry(entries, channel, dirs, &month_as_string).await;
         } else {
-            println!("error for month")
+            info!("error for month")
         }
     }
     None
@@ -355,7 +274,7 @@ pub async fn get_months(path: web::Path<String>) -> Result<Vec<Directories>, Htt
                 months: Some(HashMap::new()),
             };
 
-            println!("{}", year_as_int);
+            info!("{}", year_as_int);
 
             let months = match std::fs::read_dir(format!(
                 "/home/tulipan/projects/FBI-agent/voice_recordings/{}/{}",
@@ -405,32 +324,20 @@ pub async fn get_months(path: web::Path<String>) -> Result<Vec<Directories>, Htt
                                 .unwrap()
                                 .push(file_name);
                         } else {
-                            println!("error for file");
+                            error!("error for file");
                         }
                     }
                 } else {
-                    println!("error for month")
+                    error!("error for month")
                 }
             }
             dirs_vec.push(dirs);
         } else {
-            println!("error for year");
+            error!("error for year");
         }
     }
 
     Ok(dirs_vec)
-}
-
-#[get("/current/{guild_id}")]
-async fn get_current_month(guild_id: String) -> impl Responder {
-    let result = get_months_v2(guild_id).await;
-
-    let resp = match result {
-        Ok(dirs_vec) => HttpResponse::Ok().json(dirs_vec),
-        Err(err) => err,
-    };
-
-    resp
 }
 
 #[get("/current/{guild_id}")]
@@ -441,8 +348,8 @@ async fn get_current_month_permission(
 ) -> impl Responder {
     let token = match token {
         Some(ok) => ok,
-        // TODO: Proper message
         None => {
+            // TODO: Proper message
             panic!("Token should be present")
         }
     };
@@ -450,16 +357,146 @@ async fn get_current_month_permission(
     let guild_id = path.into_inner();
     let guild_id_as_int = guild_id.parse::<i64>().unwrap();
 
-    // Check if the user that any kind of permission for nay of the voice channels in the guild
-    let res = match sqlx::query!(
-        "SELECT channels.name,  channel_permissions.channel_id ,kind,allow,deny FROM channels
-			INNER JOIN channel_permissions
-			ON channels.channel_id = channel_permissions.channel_id
-			WHERE channel_permissions.target_id = $1
-			AND guild_id = $2
-			AND channels.type = 2",
-        token.id,
-        guild_id_as_int
+    let start = Instant::now();
+    let permission_hashset =
+        get_available_channels_for_user(&pool, guild_id_as_int, token.id).await;
+    let duration = start.elapsed();
+
+    info!("Time elapsed in expensive_function() is: {:?}", duration);
+
+    // Check which channel the user is allow to view/connect
+
+    // for (ch, perm) in permission_hashmap.iter() {
+    //     let res = perm & Permissions::CONNECT.bits() == Permissions::CONNECT.bits();
+
+    //     info!("Can connect to channel_id :{} => {}", ch, res);
+    // }
+
+    // info!("perm_HASHMAP: {:#?}", permission_hashmap);
+
+    let result = get_channels_dir(guild_id, permission_hashset).await;
+
+    let resp = match result {
+        Ok(dirs_vec) => HttpResponse::Ok().json(dirs_vec),
+        Err(err) => err,
+    };
+
+    resp
+}
+
+// Different channels can have different permissions for roles AND specific users
+// We go over every channel - role/user combination
+// TODO: return early if admin
+// TODO: check if we can return early between each check
+pub async fn get_available_channels_for_user(
+    pool: &web::Data<Pool<Postgres>>,
+    guild_id: i64,
+    user_id: i64,
+) -> HashSet<i64> {
+    // [0] = allow, [1] = deny
+    let mut perm_hash: HashMap<i64, [i64; 2]> = HashMap::new();
+    let mut allowed_channels: HashSet<i64> = HashSet::new();
+    let mut denied_channels: HashSet<i64> = HashSet::new();
+
+    let everyone_permission = get_everyone_permission_for_guild(pool, guild_id).await;
+    let combined_permission = get_combined_perm_for_user(pool, guild_id, user_id).await;
+
+    // This is the highest non-specific permission for user
+    let total_permission = everyone_permission | combined_permission;
+
+    get_user_channel_overrides_for_user_id(user_id, guild_id, pool, &mut perm_hash).await;
+
+    // Is admin
+    if (total_permission & Permissions::ADMINISTRATOR.bits()) == Permissions::ADMINISTRATOR.bits() {
+        perm_hash.retain(|ch_id, _| {
+            allowed_channels.insert(*ch_id);
+
+            false
+        });
+    }
+
+    perm_hash.retain(|ch_id, perm_vec| {
+        let allow = (perm_vec[0] & Permissions::CONNECT.bits()) == Permissions::CONNECT.bits();
+        let deny = (perm_vec[1] & Permissions::CONNECT.bits()) == Permissions::CONNECT.bits();
+
+        if allow {
+            allowed_channels.insert(*ch_id);
+        }
+        if deny {
+            denied_channels.insert(*ch_id);
+        }
+
+        !allow && !deny
+    });
+
+    perms_for_roles_for_channel(pool, user_id, guild_id, &mut perm_hash).await;
+
+    perm_hash.retain(|ch_id, perm_vec| {
+        let allow = (perm_vec[0] & Permissions::CONNECT.bits()) == Permissions::CONNECT.bits();
+        let deny = (perm_vec[1] & Permissions::CONNECT.bits()) == Permissions::CONNECT.bits();
+
+        // If both allow and deny are true the allow value overrides the deny
+        if (allow == true) && (deny == true) {
+            allowed_channels.insert(*ch_id);
+            return !allow && !deny;
+        }
+
+        if allow {
+            allowed_channels.insert(*ch_id);
+        }
+        if deny {
+            denied_channels.insert(*ch_id);
+        }
+
+        !allow && !deny
+    });
+
+    get_everyone_permission_for_each_channel(pool, guild_id, &mut perm_hash).await;
+
+    perm_hash.retain(|ch_id, perm_vec| {
+        let allow = (perm_vec[0] & Permissions::CONNECT.bits()) == Permissions::CONNECT.bits();
+        let deny = (perm_vec[1] & Permissions::CONNECT.bits()) == Permissions::CONNECT.bits();
+
+        if allow {
+            allowed_channels.insert(*ch_id);
+        }
+        if deny {
+            denied_channels.insert(*ch_id);
+        }
+
+        !allow && !deny
+    });
+
+    // Final most general check. Check @everyone
+    perm_hash.retain(|ch_id, perm_vec| {
+        let allow = ((perm_vec[0] | total_permission) & Permissions::CONNECT.bits())
+            == Permissions::CONNECT.bits();
+
+        if allow {
+            allowed_channels.insert(*ch_id);
+        }
+
+        !allow
+    });
+
+    info!("ALLOWED: {:#?}", allowed_channels);
+    info!("DENIED: {:#?}", denied_channels);
+    info!("LEFT: {:#?}", perm_hash);
+
+    allowed_channels
+}
+
+async fn get_user_channel_overrides_for_user_id(
+    user_id: i64,
+    guild_id: i64,
+    pool: &web::Data<Pool<Postgres>>,
+    perm_hash: &mut HashMap<i64, [i64; 2]>,
+) {
+    let specfic_perm_for_channel = match sqlx::query!(
+        "SELECT allow, deny, channel_id as \"channel_id!\", name as 
+			\"name!\" FROM get_user_channel_overriders_for_user_id($1, $2)",
+        user_id,
+        guild_id
     )
     .fetch_all(pool.get_ref())
     .await
@@ -471,64 +508,25 @@ async fn get_current_month_permission(
         }
     };
 
-    let res2 = match sqlx::query!(
-        "SELECT * FROM user_guilds 
-			WHERE user_id = $1 
-			AND id = $2",
-        token.id,
-        guild_id_as_int
-    )
-    .fetch_one(pool.get_ref())
-    .await
-    {
-        Ok(ok) => ok,
-        Err(_) => {
-            // TODO:
-            panic!("Error ")
-        }
-    };
-
-    info!("{:#?}", res);
-
-    // sqlx::query!("SELECT channel_id, kind, allow, deny FROM channel_permissions");
-
-    let result = get_months_v2(guild_id).await;
-
-    let resp = match result {
-        Ok(dirs_vec) => HttpResponse::Ok().json(dirs_vec),
-        Err(err) => err,
-    };
-
-    resp
+    // member specific override
+    for specific_perm in specfic_perm_for_channel {
+        perm_hash.insert(
+            specific_perm.channel_id,
+            [
+                specific_perm.allow.unwrap_or(0),
+                specific_perm.deny.unwrap_or(0),
+            ],
+        );
+    }
 }
 
-#[get("/audio/{guild_id}/{channel_id}/{year}/{month}/{file_name}")]
-async fn get_audio(
-    req: HttpRequest,
-    path: web::Path<(u64, String, i32, String, String)>,
+#[get("/current/{guild_id}")]
+async fn perm_calc(
+    _path: web::Path<String>,
+    _token: Option<ReqData<Token<Access>>>,
+    _pool: web::Data<Pool<Postgres>>,
 ) -> impl Responder {
-    use actix_files::NamedFile;
-    let path = path.into_inner();
-    let guild_id = path.0;
-    let channel_id = path.1;
-    let year = path.2;
-    let month = path.3;
-    let file_name = path.4;
-
-    println!(
-        "/home/tulipan/projects/FBI-agent/voice_recordings_v2/{}/{}/{}/{}/{}",
-        guild_id, channel_id, year, month, file_name
-    );
-
-    NamedFile::open_async(format!(
-        "/home/tulipan/projects/FBI-agent/voice_recordings_v2/{}/{}/{}/{}/{}",
-        guild_id, channel_id, year, month, file_name
-    ))
-    .await
-    .unwrap()
-    .into_response(&req)
-
-    // HttpResponse::Ok()
+    HttpResponse::Ok()
 }
 
 #[derive(Deserialize, Debug)]
@@ -536,203 +534,6 @@ struct StartEnd {
     start: Option<f32>,
     end: Option<f32>,
     name: Option<String>,
-}
-
-#[get("/download/{guild_id}/{year}/{month}/{file_name}")]
-async fn download_audio(
-    pool: web::Data<Pool<Postgres>>,
-    _req: HttpRequest,
-    path: web::Path<(i64, i32, String, String)>,
-    clip_duration: web::Query<StartEnd>,
-) -> Either<HttpResponse, actix_files::NamedFile> {
-    let path = path.into_inner();
-    let guild_id = &path.0;
-    let year = &path.1;
-    let month = &path.2;
-    let file_name_from_url = &path.3;
-
-    info!("{:#?}", clip_duration);
-
-    let file_name_without_guild_id = format!("{}/{}/{}", year, month, file_name_from_url);
-    if clip_duration.end.is_some() && clip_duration.start.is_some() {
-        // Clip
-        let child = crop_ffmpeg(
-            clip_duration.start.unwrap(),
-            clip_duration.end.unwrap(),
-            format!(
-                "{}{}/{}",
-                RECORDING_PATH, guild_id, &file_name_without_guild_id
-            )
-            .as_str(),
-        )
-        .await;
-
-        // Check if the user provided a name. Otherwise use the file name
-        let clip_name = if clip_duration.name.is_some() {
-            clip_duration.name.as_ref().unwrap()
-        } else {
-            &file_name_without_guild_id
-        };
-
-        let output = child.wait_with_output().unwrap();
-        // TODO: use the user id of the person who clipped it
-        // Needs to implement a login system first
-        let (user_id, _) = file_name_from_url
-            .split_once('-')
-            .expect("expected valid string");
-        // println!("Result: {:?}", &output.stdout);
-        // println!("Error: {}", String::from_utf8(output.stderr).unwrap());
-        match save_bytes_to_file(
-            output.stdout.clone(),
-            pool,
-            user_id,
-            clip_name,
-            &file_name_without_guild_id,
-            guild_id,
-            &clip_duration,
-        )
-        .await
-        {
-            Ok(_) => {}
-            Err(_) => return Either::Left(HttpResponse::BadRequest().body("duplicate")),
-        };
-
-        Either::Left(
-            HttpResponse::Ok()
-                // tell the browser what type of file it is
-                .content_type("audio/ogg")
-                // tell the browser to download the file
-                .append_header((
-                    "content-disposition",
-                    format!("attachment; filename=\"{clip_name}.ogg\""),
-                ))
-                // send the bytes
-                .body(output.stdout),
-        )
-    } else {
-        // Download full file
-        info!(
-            "file_paht: {:#?}",
-            format!(
-                "{}{}/{}",
-                RECORDING_PATH, guild_id, &file_name_without_guild_id
-            )
-        );
-        let file = actix_files::NamedFile::open(
-            format!(
-                "{}{}/{}",
-                RECORDING_PATH, guild_id, &file_name_without_guild_id
-            )
-            .as_str(),
-        )
-        .unwrap();
-
-        Either::Right(
-            file.use_last_modified(true)
-                .set_content_disposition(ContentDisposition {
-                    disposition: DispositionType::Attachment,
-                    parameters: vec![],
-                }),
-        )
-    }
-}
-
-async fn save_bytes_to_file(
-    bytes: Vec<u8>,
-    pool: web::Data<Pool<Postgres>>,
-    user_id: &str,
-    clip_name: &str,
-    file_name: &str,
-    guild_id: &i64,
-    clip_duration: &web::Query<StartEnd>,
-) -> Result<(), DBErrors> {
-    let path = format!("{}{}.ogg", CLIPS_PATH, clip_name);
-    info!(path);
-    let mut command = match Command::new("ffmpeg")
-        // override file
-        .arg("-y")
-        // input
-        .args(["-i", "-"])
-        .args(["-c:v", "copy"])
-        .args(["-c:a", "copy"])
-        // since we pipe the output we have to tell ffmpeg whats its gonna be
-        .args(["-f", "ogg"])
-        .arg(path)
-        // output to file
-        // .arg(&file_path)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-    {
-        Ok(result) => result,
-        Err(err) => {
-            panic!("error: {}", err);
-        }
-    };
-
-    let stdin = command.stdin.as_mut().unwrap();
-    stdin.write_all(&bytes).expect("could not write to stdin");
-
-    let output = command.wait_with_output();
-
-    info!("output = {:?}", output);
-
-    let result = match sqlx::query!(
-			"INSERT INTO favorites (user_id, clip_name, file_name, clip_start, clip_end, guild_id) VALUES ($1, $2, $3, $4, $5, $6)",
-			user_id.parse::<i64>().unwrap(),
-			clip_name,
-			file_name,
-			clip_duration.start.unwrap(),
-			clip_duration.end.unwrap(),
-			guild_id
-		)
-		.execute(pool.get_ref())
-		.await {
-		Ok(_) => {Ok(())},
-		Err(err) => {
-			let db_error = err.as_database_error().unwrap().code().unwrap();
-			error!("TODO: send response back: {}", db_error);
-			match db_error.as_ref() {
-				"23505" => {Err(DBErrors::UniqueViolation)}
-				_ => {Err(DBErrors::Unknown)}
-			}
-
-		},
-	};
-
-    result
-}
-
-// TODO: save it to a file as well
-async fn crop_ffmpeg(start: f32, end: f32, file_path: &str) -> Child {
-    let command = match Command::new("ffmpeg")
-        // seek to
-        .args(["-ss", &start.to_string()])
-        // input
-        .args(["-i", file_path])
-        // length
-        .args(["-t", &end.to_string()])
-        // copy the codec
-        .args(["-c", "copy"])
-        // since we pipe the output we have to tell ffmpeg whats its gonna be
-        .args(["-f", "ogg"])
-        // output to pipe
-        .arg("-")
-        // output to file
-        // .arg(&file_path)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-    {
-        Ok(result) => result,
-        Err(err) => {
-            panic!("error: {}", err);
-        }
-    };
-
-    command
 }
 
 async fn not_found() -> impl Responder {
@@ -772,6 +573,10 @@ async fn main() {
 
     tracing::subscriber::set_global_default(subscriber).expect("setting default subscriber failed");
 
+    let (tx, mut rx1) = tokio::sync::broadcast::channel::<i32>(2);
+    let hashmap: Arc<Mutex<HashMap<String, tokio::sync::broadcast::Receiver<f32>>>> =
+        Arc::new(Mutex::new(HashMap::new()));
+
     let b = HttpServer::new(move || {
         let logger = Logger::default();
         // Create the singing keys once. reuse them for every encode/decode
@@ -781,6 +586,7 @@ async fn main() {
             access_decode: DecodingKey::from_secret(ACCESS_SECRET.as_bytes()),
             refresh_decode: DecodingKey::from_secret(REFRESH_SECRET.as_bytes()),
         };
+
         let get_scope = web::scope("/get")
             .service(get_years_dir)
             .service(get_months_dir)
@@ -791,11 +597,15 @@ async fn main() {
             .service(get_current_user)
             .service(get_current_user_guilds)
             .service(get_token)
-            .service(get_current_month_permission);
+            .service(get_current_month_permission)
+            .service(perm_calc)
+            .service(delete);
         App::new()
             .wrap(logger)
             .app_data(web::Data::new(pool.clone()))
             .app_data(web::Data::new(reqwest::Client::new()))
+            .app_data(web::Data::new(hashmap.clone()))
+            .service(web_socket)
             .service(get_scope)
             .service(api_scope)
             .app_data(web::Data::new(keys))
@@ -804,6 +614,8 @@ async fn main() {
             .service(get_clips)
             .service(get_clip)
             .service(play_clip)
+            .service(get_waveform_data)
+            .service(remove_silence)
             .default_service(web::route().to(not_found))
             .wrap(
                 Cors::permissive(), // Cors::default()
@@ -829,7 +641,7 @@ async fn main() {
         let addr = "[::1]:50051".parse().unwrap();
         let greeter = MyGreeter::default();
 
-        println!("GreeterServer listening on {}", addr);
+        info!("GreeterServer listening on {}", addr);
 
         Server::builder()
             .add_service(GreeterServer::new(greeter))
@@ -852,6 +664,10 @@ use futures_util::future::LocalBoxFuture;
 use crate::auth::{Access, Refresh, Token};
 use crate::grpc::hello_world::greeter_server::GreeterServer;
 use crate::grpc::MyGreeter;
+use crate::permissions::{
+    get_combined_perm_for_user, get_everyone_permission_for_each_channel,
+    perms_for_roles_for_channel, Permissions,
+};
 
 // There are two steps in middleware processing.
 // 1. Middleware initialization, middleware factory gets called with
@@ -920,8 +736,6 @@ where
             let keys = req.app_data::<web::Data<AccessKeys>>().unwrap();
 
             let (access_token, refresh_token) = get_access_and_refresh_tokens(cookie);
-
-            info!("COOKIES: {:#?}", access_token);
 
             let decoded_access = Token::<Access>::decode(access_token, keys);
             let _decoded_refresh = Token::<Refresh>::decode(refresh_token, keys);
