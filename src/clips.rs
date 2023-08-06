@@ -1,3 +1,5 @@
+use std::fs::remove_file;
+
 use actix_web::{
     get,
     http::header::{ContentDisposition, DispositionType},
@@ -9,16 +11,17 @@ use serde::{Deserialize, Serialize};
 use serde_repr::{Deserialize_repr, Serialize_repr};
 use serde_with::{As, DisplayFromStr};
 use sqlx::{Pool, Postgres};
-use tracing::info;
+use tracing::{error, info};
 
 use hello_world::jammer_client::JammerClient;
 use hello_world::JamData;
 
 pub mod hello_world {
+    #![allow(non_snake_case)]
     tonic::include_proto!("helloworld");
 }
 
-use crate::{clips::hello_world::jam_response::JamResponseEnum, CLIPS_PATH};
+use crate::{clips::hello_world::jam_response::JamResponseEnum, errors::ApiResponse, CLIPS_PATH};
 use serde_json::json;
 
 type DisplayFromstr = As<DisplayFromStr>;
@@ -154,5 +157,51 @@ pub async fn play_clip(info: web::Json<JamItBody>) -> impl Responder {
         JamResponseEnum::Ok => HttpResponse::Ok().body("ok"),
         JamResponseEnum::NotPressent => HttpResponse::Ok().json(json!({"code" : 1})),
         JamResponseEnum::Unkown => HttpResponse::Ok().json(json!({"code" : 2})),
+    }
+}
+
+#[post("audio/clips/delete/{guild_id}")]
+pub async fn delete(
+    file_name: String,
+    pool: web::Data<Pool<Postgres>>,
+    _path: web::Path<i64>,
+) -> impl Responder {
+    // let guild_id = path.into_inner();
+    let guild_id = 5423;
+
+    let result = match sqlx::query!(
+        r#"
+    	DELETE FROM favorites
+    	WHERE guild_id = $1 AND
+		file_name = $2
+    	"#,
+        guild_id,
+        file_name
+    )
+    .execute(pool.get_ref())
+    .await
+    {
+        Ok(ok) => ok,
+        Err(_) => return HttpResponse::Ok().json(ApiResponse::FILE_ALREADY_DELETED()),
+    };
+
+    if result.rows_affected() == 1 {
+        // we succesfully delete something
+        let res = remove_file(format!("{}{}", CLIPS_PATH, file_name));
+
+        let _res = match res {
+            Ok(_) => {
+                info!("file deleted");
+                HttpResponse::Ok().json(ApiResponse::OK())
+            }
+            Err(_err) => {
+                error!("file cannot be deleted");
+                error!("{:?}", _err.kind());
+                HttpResponse::NotFound().json({})
+            }
+        };
+        return _res;
+    } else {
+        return HttpResponse::NotFound().json(ApiResponse::OK());
     }
 }
