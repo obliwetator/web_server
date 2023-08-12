@@ -3,7 +3,7 @@ use std::{
     fs,
     io::Write,
     path::Path,
-    process::{Child, Command, Stdio},
+    process::Stdio,
     sync::{Arc, Mutex},
 };
 
@@ -13,7 +13,10 @@ use actix_web::{
     http::header::{ContentDisposition, DispositionParam, DispositionType},
     web, Either, HttpRequest, HttpResponse, Responder,
 };
+use actix_web_lab::sse;
+
 use sqlx::{Pool, Postgres};
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tracing::{error, info};
 
 use crate::{DBErrors, StartEnd, CLIPS_PATH, NO_SILENCE_RECORDING_PATH, RECORDING_PATH};
@@ -100,53 +103,69 @@ async fn remove_silence(
     req: HttpRequest,
     path: web::Path<(i64, i64, i32, String, String)>,
     hashmap: web::Data<Arc<Mutex<HashMap<String, tokio::sync::broadcast::Receiver<f32>>>>>,
-) -> Either<HttpResponse, actix_files::NamedFile> {
-    let (tx, mut rx1) = tokio::sync::broadcast::channel::<f32>(2);
+) -> impl Responder {
+    // let (tx, rx) = sse::channel(10);
+    // tx.send(sse::Data::new("connected")).await.unwrap();
+
+    // tokio::spawn(async move {
+    //     loop {
+    //         let res = sse::Data::new("a").id("le id").event("le event");
+    //         let _ = tx.send(res).await;
+
+    //         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    //     }
+    // });
+
+    // return rx;
 
     let idemonpotency = match handle_idempotency_key(&req) {
         Ok(ok) => ok,
-        Err(_) => return Either::Left(HttpResponse::BadRequest().finish()),
+        Err(_) => return HttpResponse::BadRequest().finish(),
     };
-    if let Some(item) = hashmap.lock().unwrap().insert(idemonpotency, rx1) {
-        // a reqeust with the same key has been already handled by this function
-        info!("{:?}", item);
 
-        return Either::Left(HttpResponse::Accepted().finish());
-    }
+    // let idemonpotency = "1".to_string();
 
     let path = path.into_inner();
-    let file_path = get_file_path_root(RECORDING_PATH, &path);
+    let file_path: String = get_file_path_root(RECORDING_PATH, &path);
     let no_silence_file_path = get_file_path_root(NO_SILENCE_RECORDING_PATH, &path);
-
-    panic!("");
 
     info!("File name: {}", path.4);
     info!("File Path: {}", file_path);
     info!("no_silence_file_path: {}", no_silence_file_path);
 
-    if file_exists(&(no_silence_file_path + &path.4)) {
+    if file_exists(&(no_silence_file_path.to_owned() + &path.4)) {
         // That file was already created
         let file_no_silence = no_silence_file_path + path.4.as_str();
-        let file = match NamedFile::open_async(file_no_silence).await {
-            Ok(ok) => ok,
-            Err(err) => {
-                panic!("{err}")
-            }
-        };
-        Either::Left(HttpResponse::NotFound().finish())
+
+        HttpResponse::Conflict().json(format!(
+            r#"{{"url":{},"message":"File already exists"}}"#,
+            file_no_silence
+        ))
     } else {
+        let (_tx, rx1) = tokio::sync::broadcast::channel::<f32>(2);
+        if let Some(item) = hashmap
+            .lock()
+            .unwrap()
+            .insert(idemonpotency.to_owned(), rx1)
+        {
+            // a reqeust with the same key has been already handled by this function
+            info!("{:?}", item);
+            return HttpResponse::Accepted().finish();
+        }
+
         let res = fs::create_dir_all(&no_silence_file_path);
         match res {
             Ok(_) => (),
             Err(err) => {
+                hashmap.lock().unwrap().remove(&idemonpotency);
                 panic!("{err}")
             }
         }
 
-        let file = file_path + path.4.as_str();
-        let file_no_silence = no_silence_file_path + path.4.as_str();
+        let file: String = file_path + "/" + path.4.as_str();
+        let file_no_silence = no_silence_file_path + "/" + path.4.as_str();
 
-        let command = match Command::new("ffmpeg")
+        let command = match tokio::process::Command::new("ffmpeg")
             .args(["-i", &file])
             .args([
                 "-af",
@@ -160,17 +179,19 @@ async fn remove_silence(
         {
             Ok(result) => result,
             Err(err) => {
+                hashmap.lock().unwrap().remove(&idemonpotency);
                 panic!("error: {}", err);
             }
         };
 
-        let output = command.wait_with_output().unwrap();
+        let output = command.wait_with_output().await.unwrap();
 
-        info!("Err: {:#?}", output.stderr);
+        info!("Err: {}", String::from_utf8(output.stderr).unwrap());
         info!("Status: {}", output.status);
-        info!("Out: {:#?}", output.stdout);
+        info!("Out: {}", String::from_utf8(output.stdout).unwrap());
 
-        Either::Left(HttpResponse::Ok().finish())
+        hashmap.lock().unwrap().remove(&idemonpotency);
+        HttpResponse::Ok().finish()
     }
 }
 
@@ -313,7 +334,7 @@ async fn save_bytes_to_file(
 ) -> Result<(), DBErrors> {
     let path = format!("{}{}.ogg", CLIPS_PATH, clip_name);
     info!(path);
-    let mut command = match Command::new("ffmpeg")
+    let mut command = match std::process::Command::new("ffmpeg")
         // override file
         .arg("-y")
         // input
@@ -370,8 +391,8 @@ async fn save_bytes_to_file(
 }
 
 // TODO: save it to a file as well
-async fn crop_ffmpeg(start: f32, end: f32, file_path: &str) -> Child {
-    let command = match Command::new("ffmpeg")
+async fn crop_ffmpeg(start: f32, end: f32, file_path: &str) -> std::process::Child {
+    let command = match std::process::Command::new("ffmpeg")
         // seek to
         .args(["-ss", &start.to_string()])
         // input
