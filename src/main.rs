@@ -3,7 +3,6 @@ mod auth;
 mod clips;
 mod errors;
 mod grpc;
-mod jwt_numeric_date;
 mod permissions;
 mod roles;
 mod user;
@@ -12,18 +11,18 @@ mod websocket;
 use actix_web::body::EitherBody;
 use actix_web::middleware::Logger;
 use actix_web::web::ReqData;
-use audio::{download_audio, get_audio, get_waveform_data, remove_silence};
+use audio::{download_audio, find_similar, get_audio, get_waveform_data, remove_silence};
 use auth::{discord_login, get_token, ACCESS_SECRET, REFRESH_SECRET};
 use clips::{delete, get_clip, get_clips, play_clip};
 use jsonwebtoken::{DecodingKey, EncodingKey};
 use permissions::get_everyone_permission_for_guild;
 use sqlx::Postgres;
+use tokio::sync::RwLock;
 use websocket::web_socket;
 
 use std::collections::{HashMap, HashSet};
 use std::fs::ReadDir;
 
-use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tonic::transport::Server;
 use user::{get_current_user, get_current_user_guilds};
@@ -65,7 +64,6 @@ pub const RECORDING_PATH: &str = "/home/tulipan/projects/FBI-agent/voice_recordi
 pub const NO_SILENCE_RECORDING_PATH: &str =
     "/home/tulipan/projects/FBI-agent/no_silence_voice_recordings/";
 pub const CLIPS_PATH: &str = "/home/tulipan/projects/FBI-agent/clips/";
-
 
 #[inline]
 async fn for_entry(entries: ReadDir, _channel: u64, dirs: &mut Directories, month_as_string: &str) {
@@ -547,11 +545,19 @@ pub struct AccessKeys {
     pub refresh_decode: DecodingKey,
 }
 
+#[derive(Debug)]
+// struct HashMapContainer(pub Arc<Mutex<HashMap<String, tokio::sync::broadcast::Receiver<f32>>>>);
+
+struct HashMapContainer(pub RwLock<HashMap<String, u32>>);
+
 #[actix_web::main]
 async fn main() {
     // std::env::set_var("RUST_LOG", "debug");
     // std::env::set_var("RUST_BACKTRACE", "1");
     env_logger::init();
+
+    let hashmap = web::Data::new(HashMapContainer(RwLock::new(HashMap::new())));
+    // Clone here, this one will be owned by the first closure = hashmap;
 
     let pool = PgPoolOptions::new()
         .max_connections(5)
@@ -573,9 +579,12 @@ async fn main() {
 
     tracing::subscriber::set_global_default(subscriber).expect("setting default subscriber failed");
 
-    let (tx, mut rx1) = tokio::sync::broadcast::channel::<i32>(2);
-    let hashmap: Arc<Mutex<HashMap<String, tokio::sync::broadcast::Receiver<f32>>>> =
-        Arc::new(Mutex::new(HashMap::new()));
+    let mut builder =
+        openssl::ssl::SslAcceptor::mozilla_intermediate(openssl::ssl::SslMethod::tls()).unwrap();
+    builder
+        .set_private_key_file("key.pem", openssl::ssl::SslFiletype::PEM)
+        .unwrap();
+    builder.set_certificate_chain_file("cert.pem").unwrap();
 
     let b = HttpServer::new(move || {
         let logger = Logger::default();
@@ -587,35 +596,31 @@ async fn main() {
             refresh_decode: DecodingKey::from_secret(REFRESH_SECRET.as_bytes()),
         };
 
-        let get_scope = web::scope("/get")
-            .service(get_years_dir)
-            .service(get_months_dir)
-            .service(get_recording_for_month);
         let api_scope = web::scope("/api")
             .wrap(AuthMiddleware)
             .service(discord_login)
             .service(get_current_user)
             .service(get_current_user_guilds)
             .service(get_token)
+            .service(find_similar)
             .service(get_current_month_permission)
             .service(perm_calc)
+            .service(remove_silence)
             .service(delete);
         App::new()
             .wrap(logger)
             .app_data(web::Data::new(pool.clone()))
             .app_data(web::Data::new(reqwest::Client::new()))
-            .app_data(web::Data::new(hashmap.clone()))
-            .service(web_socket)
-            .service(get_scope)
-            .service(api_scope)
+            .app_data(hashmap.clone())
             .app_data(web::Data::new(keys))
+            .service(web_socket)
+            .service(api_scope)
             .service(get_audio)
             .service(download_audio)
             .service(get_clips)
             .service(get_clip)
             .service(play_clip)
             .service(get_waveform_data)
-            .service(remove_silence)
             .default_service(web::route().to(not_found))
             .wrap(
                 Cors::permissive(), // Cors::default()
@@ -623,17 +628,8 @@ async fn main() {
                                     //     .allow_any_header()
                                     //     .allow_any_method(),
             )
-        // .wrap_fn(|req, srv| {
-        //     let fut = srv.call(req);
-        //     async {
-        //         let mut res = fut.await?;
-        //         res.headers_mut()
-        //             .insert(ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("text/plain"));
-        //         Ok(res)
-        //     }
-        // })
     })
-    .bind(("127.0.0.1", 8080))
+    .bind_openssl("127.0.0.1:8080", builder)
     .unwrap()
     .run();
 

@@ -1,11 +1,4 @@
-use std::{
-    collections::HashMap,
-    fs,
-    io::Write,
-    path::Path,
-    process::Stdio,
-    sync::{Arc, Mutex},
-};
+use std::{fs, io::Write, path::Path, process::Stdio};
 
 use actix_files::NamedFile;
 use actix_web::{
@@ -13,13 +6,15 @@ use actix_web::{
     http::header::{ContentDisposition, DispositionParam, DispositionType},
     web, Either, HttpRequest, HttpResponse, Responder,
 };
-use actix_web_lab::sse;
 
+use serde_json::json;
 use sqlx::{Pool, Postgres};
-use tokio::io::{AsyncBufReadExt, BufReader};
-use tracing::{error, info};
 
-use crate::{DBErrors, StartEnd, CLIPS_PATH, NO_SILENCE_RECORDING_PATH, RECORDING_PATH};
+use tracing::{error, info, warn};
+
+use crate::{
+    DBErrors, HashMapContainer, StartEnd, CLIPS_PATH, NO_SILENCE_RECORDING_PATH, RECORDING_PATH,
+};
 
 #[get("/audio/waveform/{file}")]
 async fn get_waveform_data(req: HttpRequest, path: web::Path<String>) -> impl Responder {
@@ -84,14 +79,16 @@ fn handle_idempotency_key(req: &HttpRequest) -> Result<String, ()> {
     let header = match req.headers().get("Idempotency-Key") {
         Some(ok) => ok,
         None => {
-            panic!()
+            error!("Idempotency key is missing");
+            return Err(());
         }
     };
 
     let res = match header.to_str() {
         Ok(ok) => ok.to_owned(),
         Err(_) => {
-            panic!()
+            error!("No value in Idempotency header");
+            return Err(());
         }
     };
 
@@ -102,95 +99,86 @@ fn handle_idempotency_key(req: &HttpRequest) -> Result<String, ()> {
 async fn remove_silence(
     req: HttpRequest,
     path: web::Path<(i64, i64, i32, String, String)>,
-    hashmap: web::Data<Arc<Mutex<HashMap<String, tokio::sync::broadcast::Receiver<f32>>>>>,
+    hashmap: web::Data<HashMapContainer>,
 ) -> impl Responder {
-    // let (tx, rx) = sse::channel(10);
-    // tx.send(sse::Data::new("connected")).await.unwrap();
-
-    // tokio::spawn(async move {
-    //     loop {
-    //         let res = sse::Data::new("a").id("le id").event("le event");
-    //         let _ = tx.send(res).await;
-
-    //         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    //     }
-    // });
-
-    // return rx;
-
     let idemonpotency = match handle_idempotency_key(&req) {
         Ok(ok) => ok,
         Err(_) => return HttpResponse::BadRequest().finish(),
     };
-
-    // let idemonpotency = "1".to_string();
-
     let path = path.into_inner();
     let file_path: String = get_file_path_root(RECORDING_PATH, &path);
     let no_silence_file_path = get_file_path_root(NO_SILENCE_RECORDING_PATH, &path);
 
     info!("File name: {}", path.4);
-    info!("File Path: {}", file_path);
-    info!("no_silence_file_path: {}", no_silence_file_path);
 
-    if file_exists(&(no_silence_file_path.to_owned() + &path.4)) {
+    if file_exists(&(no_silence_file_path.to_owned() + "/" + &path.4 + ".ogg")) {
         // That file was already created
-        let file_no_silence = no_silence_file_path + path.4.as_str();
-
-        HttpResponse::Conflict().json(format!(
-            r#"{{"url":{},"message":"File already exists"}}"#,
-            file_no_silence
-        ))
+        let file_no_silence = no_silence_file_path + path.4.as_str() + ".ogg";
+        info!("Audio with removed silence already exists");
+        let json = json!({"url":file_no_silence,"message":"File already exists"});
+        HttpResponse::Conflict().json(json)
     } else {
-        let (_tx, rx1) = tokio::sync::broadcast::channel::<f32>(2);
-        if let Some(item) = hashmap
-            .lock()
-            .unwrap()
-            .insert(idemonpotency.to_owned(), rx1)
+        // let (_tx, rx1) = tokio::sync::broadcast::channel::<f32>(2);
         {
-            // a reqeust with the same key has been already handled by this function
-            info!("{:?}", item);
-            return HttpResponse::Accepted().finish();
+            if hashmap.0.read().await.contains_key(&idemonpotency) {
+                warn!(
+                    "a request with the same key has been already handled by this function {:?}",
+                    &idemonpotency
+                );
+                return HttpResponse::Accepted().finish();
+            } else {
+                hashmap.0.write().await.insert(idemonpotency.to_owned(), 0);
+            }
         }
 
         let res = fs::create_dir_all(&no_silence_file_path);
-        match res {
-            Ok(_) => (),
-            Err(err) => {
-                hashmap.lock().unwrap().remove(&idemonpotency);
-                panic!("{err}")
+        {
+            match res {
+                Ok(_) => (),
+                Err(err) => {
+                    // Something went very wrong when making the dir
+                    hashmap.0.write().await.remove(&idemonpotency);
+                    panic!("{err}")
+                }
             }
         }
 
-        let file: String = file_path + "/" + path.4.as_str();
-        let file_no_silence = no_silence_file_path + "/" + path.4.as_str();
+        let file: String = file_path + "/" + path.4.as_str() + ".ogg";
+        let file_no_silence = no_silence_file_path + "/" + path.4.as_str() + ".ogg";
 
-        let command = match tokio::process::Command::new("ffmpeg")
-            .args(["-i", &file])
-            .args([
-                "-af",
-                "silenceremove=stop_periods=-1:stop_duration=1:stop_threshold=-40dB",
-            ])
-            .arg(file_no_silence)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-        {
-            Ok(result) => result,
-            Err(err) => {
-                hashmap.lock().unwrap().remove(&idemonpotency);
-                panic!("error: {}", err);
-            }
-        };
+        let hashmap_clone = hashmap.clone();
+        let idem_clone = idemonpotency.to_owned();
+        actix_rt::spawn(async move {
+            let command = match std::process::Command::new("ffmpeg")
+                .args(["-i", &file])
+                .args([
+                    "-af",
+                    "silenceremove=stop_periods=-1:stop_duration=1:stop_threshold=-40dB",
+                ])
+                .arg(file_no_silence)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+            {
+                Ok(result) => result,
+                Err(err) => {
+                    // Something when very wrong when spawing the process
+                    hashmap_clone.0.write().await.remove(&idem_clone);
+                    panic!("error: {}", err);
+                }
+            };
 
-        let output = command.wait_with_output().await.unwrap();
+            let output = command.wait_with_output().unwrap();
+            info!("Err: {}", String::from_utf8(output.stderr).unwrap());
+            info!("Status: {}", output.status);
+            info!("Out: {}", String::from_utf8(output.stdout).unwrap());
+        })
+        .await
+        .unwrap();
 
-        info!("Err: {}", String::from_utf8(output.stderr).unwrap());
-        info!("Status: {}", output.status);
-        info!("Out: {}", String::from_utf8(output.stdout).unwrap());
+        hashmap.0.write().await.remove(&idemonpotency.to_owned());
 
-        hashmap.lock().unwrap().remove(&idemonpotency);
         HttpResponse::Ok().finish()
     }
 }
@@ -339,7 +327,6 @@ async fn save_bytes_to_file(
         .arg("-y")
         // input
         .args(["-i", "-"])
-        .args(["-c:v", "copy"])
         .args(["-c:a", "copy"])
         // since we pipe the output we have to tell ffmpeg whats its gonna be
         .args(["-f", "ogg"])
