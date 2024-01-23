@@ -17,12 +17,15 @@ use clips::{delete, get_clip, get_clips, play_clip};
 use jsonwebtoken::{DecodingKey, EncodingKey};
 use permissions::get_everyone_permission_for_guild;
 use sqlx::Postgres;
+
+use tokio::sync::broadcast::Sender;
 use tokio::sync::RwLock;
 use websocket::web_socket;
 
 use std::collections::{HashMap, HashSet};
 use std::fs::ReadDir;
 
+use std::process::Stdio;
 use std::time::Instant;
 use tonic::transport::Server;
 use user::{get_current_user, get_current_user_guilds};
@@ -66,7 +69,7 @@ pub const NO_SILENCE_RECORDING_PATH: &str =
 pub const CLIPS_PATH: &str = "/home/tulipan/projects/FBI-agent/clips/";
 
 #[inline]
-async fn for_entry(entries: ReadDir, _channel: u64, dirs: &mut Directories, month_as_string: &str) {
+async fn for_entry(entries: ReadDir, _channel: i64, dirs: &mut Directories, month_as_string: &str) {
     for entry in entries {
         if let Ok(entry) = entry {
             let file_name = File {
@@ -121,10 +124,10 @@ async fn for_channel_ids(
                 .to_str()
                 .unwrap()
                 .to_owned()
-                .parse::<u64>()
+                .parse::<i64>()
                 .unwrap();
 
-            if channel_hashset.contains(&(channel as i64)) {
+            if channel_hashset.contains(&channel) {
                 // we have the channel is the hashset. User can access this channel
                 let years = match std::fs::read_dir(format!(
                     "{}{}/{}",
@@ -161,7 +164,7 @@ async fn for_channel_ids(
 async fn for_years(
     years: ReadDir,
     guild_id: &String,
-    channel: u64,
+    channel: i64,
     dirs_vec: &mut Channels,
 ) -> Option<Result<Vec<Channels>, HttpResponse>> {
     for year in years {
@@ -207,7 +210,7 @@ async fn for_months(
     months: ReadDir,
     dirs: &mut Directories,
     guild_id: &String,
-    channel: u64,
+    channel: i64,
     year_as_int: i32,
 ) -> Option<Result<Vec<Channels>, HttpResponse>> {
     for month in months {
@@ -548,7 +551,7 @@ pub struct AccessKeys {
 #[derive(Debug)]
 // struct HashMapContainer(pub Arc<Mutex<HashMap<String, tokio::sync::broadcast::Receiver<f32>>>>);
 
-struct HashMapContainer(pub RwLock<HashMap<String, u32>>);
+struct HashMapContainer(pub RwLock<HashMap<String, Sender<i32>>>);
 
 #[actix_web::main]
 async fn main() {
@@ -578,6 +581,8 @@ async fn main() {
         .finish();
 
     tracing::subscriber::set_global_default(subscriber).expect("setting default subscriber failed");
+
+    // let res = test_endpoint(pool.clone()).await;
 
     let mut builder =
         openssl::ssl::SslAcceptor::mozilla_intermediate(openssl::ssl::SslMethod::tls()).unwrap();
@@ -758,4 +763,188 @@ fn get_access_and_refresh_tokens(cookie: &reqwest::header::HeaderValue) -> (&str
     let refresh_token = refresh[1];
 
     (access_token, refresh_token)
+}
+
+#[allow(dead_code)]
+pub async fn test_endpoint(pool: Pool<Postgres>) {
+    let guilds = match std::fs::read_dir(format!("{}", RECORDING_PATH)) {
+        Ok(ok) => ok,
+        Err(err) => {
+            error!("cannot read dir: {}", err);
+            panic!()
+        }
+    };
+
+    for guild in guilds {
+        if let Ok(entry) = guild {
+            let guild_id = entry
+                .file_name()
+                .to_str()
+                .unwrap()
+                .to_owned()
+                .parse::<i64>()
+                .unwrap();
+
+            let channel_ids = match std::fs::read_dir(format!("{}{}", RECORDING_PATH, guild_id)) {
+                Ok(ok) => ok,
+                Err(err) => {
+                    error!("{}", err);
+                    panic!();
+                }
+            };
+
+            for channel_id in channel_ids {
+                if let Ok(entry) = channel_id {
+                    let channel = entry
+                        .file_name()
+                        .to_str()
+                        .unwrap()
+                        .to_owned()
+                        .parse::<i64>()
+                        .unwrap();
+
+                    let years = match std::fs::read_dir(format!(
+                        "{}{}/{}",
+                        RECORDING_PATH, guild_id, channel
+                    )) {
+                        Ok(ok) => ok,
+                        Err(err) => {
+                            error!("{}", err);
+                            panic!();
+                        }
+                    };
+
+                    for year in years {
+                        if let Ok(entry) = year {
+                            let year_as_int = entry
+                                .file_name()
+                                .to_str()
+                                .unwrap()
+                                .to_owned()
+                                .parse::<i32>()
+                                .unwrap();
+
+                            let months = match std::fs::read_dir(format!(
+                                "{}{}/{}/{}",
+                                RECORDING_PATH, guild_id, channel, year_as_int
+                            )) {
+                                Ok(ok) => ok,
+                                Err(err) => {
+                                    error!("{}", err);
+                                    panic!();
+                                }
+                            };
+
+                            for month in months {
+                                if let Ok(entry) = month {
+                                    let month_as_string =
+                                        entry.file_name().to_str().unwrap().to_owned();
+                                    let month_as_number = match month_as_string.as_str() {
+                                        "January" => 1,
+                                        "February" => 2,
+                                        "March" => 3,
+                                        "April" => 4,
+                                        "May" => 5,
+                                        "June" => 6,
+                                        "July" => 7,
+                                        "August" => 8,
+                                        "September" => 9,
+                                        "October" => 10,
+                                        "November" => 11,
+                                        "December" => 12,
+                                        _ => 13,
+                                    };
+
+                                    let entries = match std::fs::read_dir(format!(
+                                        "{}{}/{}/{}/{}",
+                                        RECORDING_PATH,
+                                        guild_id,
+                                        channel,
+                                        year_as_int,
+                                        &month_as_string
+                                    )) {
+                                        Ok(ok) => ok,
+                                        Err(err) => {
+                                            error!("{}", err);
+                                            panic!();
+                                        }
+                                    };
+
+                                    for entry in entries {
+                                        if let Ok(entry) = entry {
+                                            let file_name =
+                                                entry.file_name().to_str().unwrap().to_owned();
+                                            let (time, user_id_and_name) = file_name
+                                                .split_once('-')
+                                                .expect("expected valid string");
+                                            let time_as_int = time.parse::<i64>().unwrap();
+                                            let (user_id, _) = user_id_and_name
+                                                .split_once('-')
+                                                .expect("expected valid string");
+                                            let user_id_as_int = user_id.parse::<i64>().unwrap();
+
+                                            let file_path = format!(
+                                                "{}{}/{}/{}/{}",
+                                                RECORDING_PATH,
+                                                guild_id,
+                                                channel,
+                                                year_as_int,
+                                                month_as_string
+                                            );
+
+                                            let command = std::process::Command::new("ffprobe")
+                                                .arg("-show_entries")
+                                                .arg("format=duration")
+                                                .args(["-of", "default=noprint_wrappers=1:nokey=1"])
+                                                .arg(format!("{}/{}", file_path, file_name))
+                                                .stderr(Stdio::null())
+                                                .stdin(Stdio::null())
+                                                .stdout(Stdio::piped())
+                                                .spawn()
+                                                .unwrap();
+
+                                            let output = command.wait_with_output().unwrap();
+                                            // let stderr = String::from_utf8(output.stderr).unwrap();
+                                            let stdout = String::from_utf8(output.stdout).unwrap();
+                                            // info!("STD ERR: {}", stderr);
+                                            info!("STD OUT: {}", stdout);
+                                            // If a file is corrupted its duration will be undefined. Set it to 0 and deal with it later
+                                            // Duration is in seconds. Convert to ms
+                                            let duration_in_ms =
+                                                (stdout.trim().parse::<f64>().unwrap_or(0.0)
+                                                    * 1000.0)
+                                                    as i64;
+
+                                            let end_ts = time_as_int + duration_in_ms;
+
+                                            match sqlx::query!(
+                                                "INSERT INTO public.audio_files(file_name, guild_id, channel_id, user_id, year, month, start_ts, end_ts) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) ON CONFLICT DO NOTHING;",
+                                                file_name,
+                                                guild_id,
+                                                channel,
+                                                user_id_as_int,
+                                                year_as_int,
+                                                month_as_number,
+                                                time_as_int,
+                                                end_ts
+                                            )
+                                            .execute(&pool)
+                                            .await
+                                            {
+                                                Ok(ok) => ok,
+                                                Err(err) => {
+                                                    error!("{}",err);
+                                                    panic!()
+                                                }
+                                            };
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
