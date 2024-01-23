@@ -164,10 +164,9 @@ pub async fn play_clip(info: web::Json<JamItBody>) -> impl Responder {
 pub async fn delete(
     file_name: String,
     pool: web::Data<Pool<Postgres>>,
-    _path: web::Path<i64>,
+    path: web::Path<i64>,
 ) -> impl Responder {
-    // let guild_id = path.into_inner();
-    let guild_id = 5423;
+    let guild_id = path.into_inner();
 
     let result = match sqlx::query!(
         r#"
