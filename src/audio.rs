@@ -7,9 +7,11 @@ use actix_web::{
     web, Either, HttpRequest, HttpResponse, Responder,
 };
 
+use serde::Deserialize;
 use serde_json::json;
 use sqlx::{Pool, Postgres};
 
+use tokio::sync::broadcast;
 use tracing::{error, info, warn};
 
 use crate::{
@@ -100,93 +102,204 @@ async fn remove_silence(
     req: HttpRequest,
     path: web::Path<(i64, i64, i32, String, String)>,
     hashmap: web::Data<HashMapContainer>,
+    pool: web::Data<Pool<Postgres>>,
 ) -> impl Responder {
+    let path = path.into_inner();
+    let file_path: String = get_file_path_root(RECORDING_PATH, &path);
+    let no_silence_file_path = get_file_path_root(NO_SILENCE_RECORDING_PATH, &path);
+    let file_no_silence = no_silence_file_path.to_owned() + path.4.as_str() + ".ogg";
+
     let idemonpotency = match handle_idempotency_key(&req) {
         Ok(ok) => ok,
         Err(_) => return HttpResponse::BadRequest().finish(),
     };
-    let path = path.into_inner();
-    let file_path: String = get_file_path_root(RECORDING_PATH, &path);
-    let no_silence_file_path = get_file_path_root(NO_SILENCE_RECORDING_PATH, &path);
 
     info!("File name: {}", path.4);
 
-    if file_exists(&(no_silence_file_path.to_owned() + "/" + &path.4 + ".ogg")) {
-        // That file was already created
-        let file_no_silence = no_silence_file_path + path.4.as_str() + ".ogg";
-        info!("Audio with removed silence already exists");
-        let json = json!({"url":file_no_silence,"message":"File already exists"});
-        HttpResponse::Conflict().json(json)
+    // We have they key in the hashmap. We are processing the request
+    if hashmap.0.read().await.contains_key(&path.4) {
+        info!("Already processing");
+        let lock = hashmap.0.read().await;
+        let sender = lock.get(&path.4).unwrap();
+        let mut rec = sender.subscribe();
+        let value = rec.recv().await.unwrap();
+
+        if value == 0 {
+            info!("received value");
+            // placeholder
+        }
+
+        let json = json!({"url":file_no_silence,"message":" Success"});
+        return HttpResponse::Accepted().json(json);
     } else {
-        // let (_tx, rx1) = tokio::sync::broadcast::channel::<f32>(2);
-        {
-            if hashmap.0.read().await.contains_key(&idemonpotency) {
-                warn!(
-                    "a request with the same key has been already handled by this function {:?}",
-                    &idemonpotency
-                );
-                return HttpResponse::Accepted().finish();
-            } else {
-                hashmap.0.write().await.insert(idemonpotency.to_owned(), 0);
-            }
-        }
+        // It's the first time we receive the request
+        // ---OR---
+        // We have already processed this request and the file already exists on the server
 
-        let res = fs::create_dir_all(&no_silence_file_path);
-        {
-            match res {
-                Ok(_) => (),
-                Err(err) => {
-                    // Something went very wrong when making the dir
-                    hashmap.0.write().await.remove(&idemonpotency);
-                    panic!("{err}")
-                }
-            }
-        }
-
-        let file: String = file_path + "/" + path.4.as_str() + ".ogg";
-        let file_no_silence = no_silence_file_path + "/" + path.4.as_str() + ".ogg";
-
-        let hashmap_clone = hashmap.clone();
-        let idem_clone = idemonpotency.to_owned();
-        actix_rt::spawn(async move {
-            let command = match std::process::Command::new("ffmpeg")
-                .args(["-i", &file])
-                .args([
-                    "-af",
-                    "silenceremove=stop_periods=-1:stop_duration=1:stop_threshold=-40dB",
-                ])
-                .arg(file_no_silence)
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
+        // Check if file exists before we try to process it.
+        if file_exists(&(no_silence_file_path.to_owned() + "/" + &path.4 + ".ogg")) {
+            info!("file already exists");
+            let json = json!({"url":file_no_silence,"message":"File already exists"});
+            return HttpResponse::Ok().json(json);
+        } else {
+            info!("Creating new file");
+            let (tx, _) = broadcast::channel::<i32>(10);
+            // File no present and its the first time we receive a request for this file
             {
-                Ok(result) => result,
-                Err(err) => {
-                    // Something when very wrong when spawing the process
-                    hashmap_clone.0.write().await.remove(&idem_clone);
-                    panic!("error: {}", err);
+                hashmap
+                    .0
+                    .write()
+                    .await
+                    .insert(path.4.to_owned(), tx.clone());
+            }
+            // Crate the directory for the file
+            let res = fs::create_dir_all(&no_silence_file_path);
+            {
+                match res {
+                    Ok(_) => (),
+                    Err(err) => {
+                        // Something went very wrong when making the dir
+                        hashmap.0.write().await.remove(&idemonpotency);
+                        panic!("{err}")
+                    }
                 }
-            };
+            }
 
-            let output = command.wait_with_output().unwrap();
-            info!("Err: {}", String::from_utf8(output.stderr).unwrap());
-            info!("Status: {}", output.status);
-            info!("Out: {}", String::from_utf8(output.stdout).unwrap());
-        })
-        .await
-        .unwrap();
+            let file: String = file_path.to_owned() + "/" + path.4.as_str() + ".ogg";
+            let file_no_silence = no_silence_file_path.to_owned() + "/" + path.4.as_str() + ".ogg";
+            let file_no_silence_clone = file_no_silence.to_owned();
 
-        hashmap.0.write().await.remove(&idemonpotency.to_owned());
+            let hashmap_clone = hashmap.clone();
+            tokio::spawn(async move {
+                let file_name = path.4.clone();
+                let command = match std::process::Command::new("ffmpeg")
+                    .args(["-i", &file])
+                    .args([
+                        "-af",
+                        "silenceremove=stop_periods=-1:stop_duration=1:stop_threshold=-40dB",
+                    ])
+                    .arg(file_no_silence_clone)
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                {
+                    Ok(result) => result,
+                    Err(err) => {
+                        // Something when very wrong when spawing the process
+                        hashmap_clone.0.write().await.remove(&path.4);
+                        panic!("error: {}", err);
+                    }
+                };
 
-        HttpResponse::Ok().finish()
+                let _output = command.wait_with_output().unwrap();
+                // info!("Err: {}", String::from_utf8(output.stderr).unwrap());
+                // info!("Status: {}", output.status);
+                // info!("Out: {}", String::from_utf8(output.stdout).unwrap());
+
+                sqlx::query!(
+                    "UPDATE public.audio_files
+				SET silence=true
+				WHERE file_name=$1;",
+                    file_name
+                )
+                .execute(pool.get_ref())
+                .await
+                .unwrap();
+
+                match tx.send(0) {
+                    Ok(_) => {
+                        // Value received
+                        info!("Value sent success");
+                    }
+                    Err(_) => {
+                        warn!("There were no receivers to receive the value.")
+                    }
+                }
+                {
+                    hashmap_clone.0.write().await.remove(&path.4);
+                }
+            });
+
+            let json = json!({"url": file_no_silence,"message":"Request Accepted"});
+            return HttpResponse::Ok().json(json);
+        }
     }
+
+    // if file_exists(&(no_silence_file_path.to_owned() + "/" + &path.4 + ".ogg")) {
+    //     // That file was already created
+    //     let file_no_silence = no_silence_file_path + path.4.as_str() + ".ogg";
+    //     info!("Audio with removed silence already exists");
+    //     let json = json!({"url":file_no_silence,"message":"File already exists"});
+    //     HttpResponse::Conflict().json(json)
+    // } else {
+
+    //     hashmap.0.write().await.remove(&idemonpotency.to_owned());
+
+    // }
 }
 
+#[get("/find/{guild_id}/{channel_id}/{year}/{month}/{file_name}")]
+async fn find_similar(
+    _req: HttpRequest,
+    path: web::Path<(u64, String, i32, String, String)>,
+) -> impl Responder {
+    let (guild_id, channel_id, year, month, file_name) = path.into_inner();
+
+    let file_path = format!(
+        "{}{}/{}/{}/{}",
+        RECORDING_PATH, guild_id, channel_id, year, month
+    );
+    let files = match std::fs::read_dir(&file_path) {
+        Ok(ok) => ok,
+        Err(err) => {
+            panic!("cannot read files {}", err);
+        }
+    };
+
+    for file in files {
+        let file_name = file.unwrap().file_name();
+        let file_n = file_name.to_string_lossy();
+        // file_n.rsplit_once('/');
+        let start = std::time::Instant::now();
+        let command = std::process::Command::new("ffprobe")
+            .arg("-show_entries")
+            .arg("format=duration")
+            .args(["-of", "default=noprint_wrappers=1:nokey=1"])
+            .arg(format!("{}/{}", file_path, file_n))
+            .stderr(Stdio::null())
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+
+        let output = command.wait_with_output().unwrap();
+
+        let duration = start.elapsed();
+
+        info!("Time elapsed in ffprobe is: {:?}", duration);
+
+        info!("Out: {}", String::from_utf8(output.stdout).unwrap());
+        // info!("ERR: {}", String::from_utf8(output.stderr).unwrap());
+    }
+
+    let (_time, user_id) = file_name.split_once('-').expect("expected valid string");
+
+    info!("1: {}, 2: {}", user_id, _time);
+
+    // info!("{:#?}", files);
+    return "";
+}
+
+#[derive(Deserialize)]
+struct AudioQuery {
+    silence: Option<bool>,
+}
 #[get("/audio/{guild_id}/{channel_id}/{year}/{month}/{file_name}")]
 async fn get_audio(
     req: HttpRequest,
     path: web::Path<(u64, String, i32, String, String)>,
+    query_param: web::Query<AudioQuery>,
 ) -> impl Responder {
     use actix_files::NamedFile;
     let path = path.into_inner();
@@ -196,20 +309,33 @@ async fn get_audio(
     let month = path.3;
     let file_name = path.4;
 
-    info!(
-        "{}{}/{}/{}/{}/{}",
-        RECORDING_PATH, guild_id, channel_id, year, month, file_name
-    );
+    let path = {
+        if let Some(value) = query_param.silence {
+            if value {
+                format!(
+                    "{}{}/{}/{}/{}/{}",
+                    NO_SILENCE_RECORDING_PATH, guild_id, channel_id, year, month, file_name
+                )
+            } else {
+                format!(
+                    "{}{}/{}/{}/{}/{}",
+                    RECORDING_PATH, guild_id, channel_id, year, month, file_name
+                )
+            }
+        } else {
+            format!(
+                "{}{}/{}/{}/{}/{}",
+                RECORDING_PATH, guild_id, channel_id, year, month, file_name
+            )
+        }
+    };
 
-    NamedFile::open_async(format!(
-        "{}{}/{}/{}/{}/{}",
-        RECORDING_PATH, guild_id, channel_id, year, month, file_name
-    ))
-    .await
-    .unwrap()
-    .into_response(&req)
+    let res = match NamedFile::open_async(path).await {
+        Ok(ok) => ok.into_response(&req),
+        Err(_) => return HttpResponse::NotFound().finish(),
+    };
 
-    // HttpResponse::Ok()
+    res
 }
 
 #[get("/download/{guild_id}/{channel_id}/{year}/{month}/{file_name}")]
@@ -252,9 +378,11 @@ async fn download_audio(
         let output = child.wait_with_output().unwrap();
         // TODO: use the user id of the person who clipped it
         // Needs to implement a login system first
-        let (user_id, _) = file_name_from_url
+        let (_time_stamp, id_and_user) = file_name_from_url
             .split_once('-')
             .expect("expected valid string");
+
+        let (user_id, _user) = id_and_user.split_once('-').expect("expected valid string");
 
         match save_bytes_to_file(
             output.stdout.clone(),
