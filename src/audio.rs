@@ -34,12 +34,7 @@ async fn get_waveform_data(req: HttpRequest, path: web::Path<String>) -> impl Re
 }
 
 async fn _get_file(path: web::Path<(i64, i64, i32, String, String)>) -> NamedFile {
-    let path = path.into_inner();
-    let guild_id = &path.0;
-    let channel_id = &path.1;
-    let year = &path.2;
-    let month = &path.3;
-    let file_name_from_url = &path.4;
+    let (guild_id, channel_id, year, month, file_name_from_url) = path.into_inner();
 
     match NamedFile::open(format!(
         "{}{}/{}/{}/{}/{}",
@@ -105,6 +100,7 @@ async fn remove_silence(
     pool: web::Data<Pool<Postgres>>,
 ) -> impl Responder {
     let path = path.into_inner();
+
     let file_path: String = get_file_path_root(RECORDING_PATH, &path);
     let no_silence_file_path = get_file_path_root(NO_SILENCE_RECORDING_PATH, &path);
     let file_no_silence = no_silence_file_path.to_owned() + path.4.as_str() + ".ogg";
@@ -302,12 +298,7 @@ async fn get_audio(
     query_param: web::Query<AudioQuery>,
 ) -> impl Responder {
     use actix_files::NamedFile;
-    let path = path.into_inner();
-    let guild_id = path.0;
-    let channel_id = path.1;
-    let year = path.2;
-    let month = path.3;
-    let file_name = path.4;
+    let (guild_id, channel_id, year, month, file_name) = path.into_inner();
 
     let path = {
         if let Some(value) = query_param.silence {
@@ -345,12 +336,7 @@ async fn download_audio(
     path: web::Path<(i64, i64, i32, String, String)>,
     clip_duration: web::Query<StartEnd>,
 ) -> Either<HttpResponse, actix_files::NamedFile> {
-    let path = path.into_inner();
-    let guild_id = &path.0;
-    let channel_id = &path.1;
-    let year = &path.2;
-    let month = &path.3;
-    let file_name_from_url = &path.4;
+    let (guild_id, channel_id, year, month, file_name_from_url) = path.into_inner();
 
     info!("{:#?}", clip_duration);
 
@@ -390,7 +376,7 @@ async fn download_audio(
             user_id,
             clip_name,
             &file_name_without_guild_id,
-            guild_id,
+            &guild_id,
             &clip_duration,
         )
         .await
