@@ -1,4 +1,7 @@
 /target
 /voice_recordings
+/no_silence_voice_recordings
 /clips
 .env
+cert.pem
+key.pem
