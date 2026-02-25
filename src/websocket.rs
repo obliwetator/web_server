@@ -55,7 +55,7 @@ impl StreamHandler<Result<ws::Message, ws::ProtocolError>> for MyWs {
     }
 }
 
-#[get("/")]
+#[get("/ws/")]
 pub async fn web_socket(req: HttpRequest, stream: web::Payload) -> Result<HttpResponse, Error> {
     let resp = ws::WsResponseBuilder::new(MyWs { hb: Instant::now() }, &req, stream).start();
     // let resp = ws::start(MyWs {}, &req, stream);
