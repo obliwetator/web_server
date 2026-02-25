@@ -4,8 +4,8 @@ mod clips;
 mod errors;
 mod grpc;
 mod permissions;
-mod roles;
 mod user;
+mod waveform;
 mod websocket;
 
 use actix_web::body::EitherBody;
@@ -26,7 +26,6 @@ use std::collections::{HashMap, HashSet};
 use std::fs::ReadDir;
 
 use std::process::Stdio;
-use std::time::Instant;
 use tonic::transport::Server;
 use user::{get_current_user, get_current_user_guilds};
 
@@ -67,6 +66,8 @@ pub const RECORDING_PATH: &str = "/home/tulipan/projects/FBI-agent/voice_recordi
 pub const NO_SILENCE_RECORDING_PATH: &str =
     "/home/tulipan/projects/FBI-agent/no_silence_voice_recordings/";
 pub const CLIPS_PATH: &str = "/home/tulipan/projects/FBI-agent/clips/";
+pub const NO_SILENCE_PREFIX: &str = "_no_silence_";
+pub const WAVEFORM_PATH: &str = "/home/tulipan/projects/FBI-agent/waveform_data/";
 
 #[inline]
 async fn for_entry(entries: ReadDir, _channel: i64, dirs: &mut Directories, month_as_string: &str) {
@@ -358,12 +359,8 @@ async fn get_current_month_permission(
     let guild_id = path.into_inner();
     let guild_id_as_int = guild_id.parse::<i64>().unwrap();
 
-    let start = Instant::now();
     let permission_hashset =
         get_available_channels_for_user(&pool, guild_id_as_int, token.id).await;
-    let duration = start.elapsed();
-
-    info!("Time elapsed in expensive_function() is: {:?}", duration);
 
     // Check which channel the user is allow to view/connect
 
@@ -480,10 +477,6 @@ pub async fn get_available_channels_for_user(
         !allow
     });
 
-    info!("ALLOWED: {:#?}", allowed_channels);
-    info!("DENIED: {:#?}", denied_channels);
-    info!("LEFT: {:#?}", perm_hash);
-
     allowed_channels
 }
 
@@ -584,14 +577,14 @@ async fn main() {
 
     // let res = test_endpoint(pool.clone()).await;
 
-    let mut builder =
-        openssl::ssl::SslAcceptor::mozilla_intermediate(openssl::ssl::SslMethod::tls()).unwrap();
-    builder
-        .set_private_key_file("key.pem", openssl::ssl::SslFiletype::PEM)
-        .unwrap();
-    builder.set_certificate_chain_file("cert.pem").unwrap();
+    // let mut builder =
+    //     openssl::ssl::SslAcceptor::mozilla_intermediate(openssl::ssl::SslMethod::tls()).unwrap();
+    // builder
+    //     .set_private_key_file("key.pem", openssl::ssl::SslFiletype::PEM)
+    //     .unwrap();
+    // builder.set_certificate_chain_file("cert.pem").unwrap();
 
-    let b = HttpServer::new(move || {
+    let server: actix_web::dev::Server = HttpServer::new(move || {
         let logger = Logger::default();
         // Create the singing keys once. reuse them for every encode/decode
         let keys = AccessKeys {
@@ -634,7 +627,7 @@ async fn main() {
                                     //     .allow_any_method(),
             )
     })
-    .bind_openssl("127.0.0.1:8080", builder)
+    .bind(("127.0.0.1", 8900))
     .unwrap()
     .run();
 
@@ -650,7 +643,7 @@ async fn main() {
             .await
     });
 
-    let _c = tokio::spawn(async move { b.await });
+    let _c = tokio::spawn(async move { server.await });
     let _res = tokio::join!(_c, _tonic);
 }
 
