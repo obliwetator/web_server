@@ -14,9 +14,15 @@ use sqlx::{Pool, Postgres};
 use tokio::sync::broadcast;
 use tracing::{error, info, warn};
 
+use bytes::Bytes;
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
+use tokio_stream::StreamExt;
+
 use crate::{
-    waveform::generate_peaks, DBErrors, HashMapContainer, StartEnd, CLIPS_PATH, NO_SILENCE_PREFIX,
-    NO_SILENCE_RECORDING_PATH, RECORDING_PATH, WAVEFORM_PATH,
+    waveform::{stream_peaks, WaveformEvent},
+    DBErrors, HashMapContainer, StartEnd, CLIPS_PATH, NO_SILENCE_PREFIX, NO_SILENCE_RECORDING_PATH,
+    RECORDING_PATH, WAVEFORM_PATH,
 };
 
 #[get("/audio/waveform/{guild_id}/{channel_id}/{year}/{month}/{file}")]
@@ -29,25 +35,38 @@ async fn get_waveform_data(
     let file_path = format!("{}/{}.ogg", base_path_recording, path.4);
 
     info!("Received request for waveform data for file: {}", file_path);
-    let output = &format!("{}{}.dat", WAVEFORM_PATH, path.4);
+    let output = format!("{}{}.dat", WAVEFORM_PATH, path.4);
     info!("Output path for waveform data: {}", output);
-    match generate_peaks(
-        file_path.as_str(),
-        output.as_str(),
-        // Default to 2500. Good enough
-        None,
-    )
-    .await
-    {
-        Ok(data) => HttpResponse::Ok()
-            .content_type("application/octet-stream")
-            .append_header((
-                "content-disposition",
-                format!("attachment; filename=\"{}.dat\"", file_path),
-            ))
-            .body(data),
-        Err(_) => HttpResponse::InternalServerError().body("Failed to generate waveform"),
-    }
+
+    let (tx, rx) = mpsc::channel::<WaveformEvent>(10);
+
+    // Spawn the generation task in the background
+    tokio::spawn(async move {
+        if let Err(e) = stream_peaks(file_path, output, None, tx).await {
+            error!("Error streaming peaks: {:?}", e);
+        }
+    });
+
+    let stream = ReceiverStream::new(rx).map(|event| match event {
+        WaveformEvent::Progress(pct) => {
+            let msg = format!("event: progress\ndata: {}\n\n", pct);
+            Ok::<Bytes, actix_web::Error>(Bytes::from(msg))
+        }
+        WaveformEvent::Complete(base64_data) => {
+            let msg = format!("event: complete\ndata: {}\n\n", base64_data);
+            Ok::<Bytes, actix_web::Error>(Bytes::from(msg))
+        }
+        WaveformEvent::Error(err_msg) => {
+            let msg = format!("event: error\ndata: {}\n\n", err_msg);
+            Ok::<Bytes, actix_web::Error>(Bytes::from(msg))
+        }
+    });
+
+    HttpResponse::Ok()
+        .append_header(("Content-Type", "text/event-stream"))
+        .append_header(("Cache-Control", "no-cache"))
+        .append_header(("Connection", "keep-alive"))
+        .streaming(stream)
 }
 
 async fn _get_file(path: web::Path<(i64, i64, i32, String, String)>) -> NamedFile {

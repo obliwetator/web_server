@@ -1,5 +1,15 @@
+use base64::prelude::*;
 use std::error::Error;
+use std::process::Stdio;
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
+use tokio::sync::mpsc;
+
+pub enum WaveformEvent {
+    Progress(u8),
+    Complete(String),
+    Error(String),
+}
 use tracing::info;
 
 /// Generates an audiowaveform track.dat file for a given audio file with a specific target number of points (pixels).
@@ -90,4 +100,134 @@ pub async fn generate_peaks(
     let file_content = tokio::fs::read(output_file).await?;
 
     Ok(file_content)
+}
+
+/// Generates an audiowaveform track.dat file for a given audio file with a specific target number of points (pixels).
+/// Yields progress events and the final Base64 encoded file via `mpsc::Sender`.
+pub async fn stream_peaks(
+    input_file: String,
+    output_file: String,
+    target_points: Option<f64>,
+    tx: mpsc::Sender<WaveformEvent>,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    // 1. Get duration and sample rate using a single ffprobe call
+    let ffprobe_output = Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration:stream=sample_rate",
+            "-of",
+            "csv=p=0",
+            "-i",
+            &input_file,
+        ])
+        .output()
+        .await?;
+
+    let output_str = String::from_utf8(ffprobe_output.stdout)?;
+    let mut lines = output_str.trim().lines();
+
+    let val1: f64 = match lines.next().and_then(|l| l.parse().ok()) {
+        Some(v) => v,
+        None => {
+            let _ = tx
+                .send(WaveformEvent::Error(
+                    "No sample rate or duration found".into(),
+                ))
+                .await;
+            return Err("No sample rate or duration found".into());
+        }
+    };
+
+    let val2: f64 = match lines.next().and_then(|l| l.parse().ok()) {
+        Some(v) => v,
+        None => {
+            let _ = tx
+                .send(WaveformEvent::Error(
+                    "Expected both sample rate and duration".into(),
+                ))
+                .await;
+            return Err("Expected both sample rate and duration".into());
+        }
+    };
+
+    let duration = val1;
+    let sample_rate = val2;
+
+    if duration <= 0.0 || sample_rate <= 0.0 {
+        let _ = tx
+            .send(WaveformEvent::Error(
+                "Duration and Sample Rate must be strictly positive".into(),
+            ))
+            .await;
+        return Err("Duration and Sample Rate must be strictly positive".into());
+    }
+
+    // 2. Calculate the zoom level
+    let zoom = ((duration * sample_rate) / target_points.unwrap_or(2500.0)).floor() as u64;
+    let zoom_val = std::cmp::max(1, zoom).to_string();
+
+    // 3. Generate peaks using audiowaveform with streaming output
+    let mut command = Command::new("audiowaveform")
+        .args([
+            "-i",
+            &input_file,
+            "-o",
+            &output_file,
+            "-z",
+            &zoom_val,
+            "-b",
+            "8",
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()?;
+
+    let stderr = command.stderr.take().unwrap();
+    let mut reader = BufReader::new(stderr);
+    let mut buf = Vec::new();
+
+    loop {
+        buf.clear();
+        // audiowaveform uses carriage returns (\r) or newlines (\n) to update progress
+        match reader.read_until(b'\r', &mut buf).await {
+            Ok(0) => break, // EOF
+            Ok(_) => {
+                info!("audiowaveform output: {}", String::from_utf8_lossy(&buf));
+                if let Ok(line) = std::str::from_utf8(&buf) {
+                    let trimmed = line.trim();
+                    if trimmed.starts_with("Done: ") {
+                        if let Some(pct_str) = trimmed.strip_prefix("Done: ") {
+                            if let Some(pct) = pct_str.strip_suffix("%") {
+                                if let Ok(pct_val) = pct.parse::<u8>() {
+                                    let _ = tx.send(WaveformEvent::Progress(pct_val)).await;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Err(_) => break, // Error reading
+        }
+    }
+
+    let status = command.wait().await?;
+    if !status.success() {
+        let _ = tx
+            .send(WaveformEvent::Error(
+                "audiowaveform exited with non-zero status".into(),
+            ))
+            .await;
+        return Err("audiowaveform exited with non-zero status".into());
+    }
+
+    info!("audiowaveform completed successfully, reading output file...");
+
+    let file_content = tokio::fs::read(&output_file).await?;
+    let base64_content = BASE64_STANDARD.encode(file_content);
+
+    let _ = tx.send(WaveformEvent::Complete(base64_content)).await;
+
+    Ok(())
 }
