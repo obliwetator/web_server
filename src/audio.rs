@@ -3,7 +3,7 @@ use std::{fs, io::Write, path::Path, process::Stdio};
 use actix_files::NamedFile;
 use actix_web::{
     get,
-    http::header::{ContentDisposition, DispositionParam, DispositionType},
+    http::header::{ContentDisposition, DispositionType},
     web, Either, HttpRequest, HttpResponse, Responder,
 };
 
@@ -15,21 +15,38 @@ use tokio::sync::broadcast;
 use tracing::{error, info, warn};
 
 use crate::{
-    DBErrors, HashMapContainer, StartEnd, CLIPS_PATH, NO_SILENCE_RECORDING_PATH, RECORDING_PATH,
+    waveform::generate_peaks, DBErrors, HashMapContainer, StartEnd, CLIPS_PATH, NO_SILENCE_PREFIX,
+    NO_SILENCE_RECORDING_PATH, RECORDING_PATH, WAVEFORM_PATH,
 };
 
-#[get("/audio/waveform/{file}")]
-async fn get_waveform_data(req: HttpRequest, path: web::Path<String>) -> impl Responder {
-    let file_name = path.into_inner();
-    match NamedFile::open_async(format!("{}{}", CLIPS_PATH, file_name)).await {
-        Ok(ok) => ok
-            .use_last_modified(true)
-            .set_content_disposition(ContentDisposition {
-                disposition: DispositionType::Attachment,
-                parameters: vec![DispositionParam::Filename(file_name)],
-            })
-            .into_response(&req),
-        Err(_) => HttpResponse::NotFound().body("File not found"),
+#[get("/audio/waveform/{guild_id}/{channel_id}/{year}/{month}/{file}")]
+async fn get_waveform_data(
+    _req: HttpRequest,
+    path: web::Path<(i64, i64, i32, String, String)>,
+) -> impl Responder {
+    let path = path.into_inner();
+    let base_path_recording: String = get_file_path_root(RECORDING_PATH, &path);
+    let file_path = format!("{}/{}.ogg", base_path_recording, path.4);
+
+    info!("Received request for waveform data for file: {}", file_path);
+    let output = &format!("{}{}.dat", WAVEFORM_PATH, path.4);
+    info!("Output path for waveform data: {}", output);
+    match generate_peaks(
+        file_path.as_str(),
+        output.as_str(),
+        // Default to 2500. Good enough
+        None,
+    )
+    .await
+    {
+        Ok(data) => HttpResponse::Ok()
+            .content_type("application/octet-stream")
+            .append_header((
+                "content-disposition",
+                format!("attachment; filename=\"{}.dat\"", file_path),
+            ))
+            .body(data),
+        Err(_) => HttpResponse::InternalServerError().body("Failed to generate waveform"),
     }
 }
 
@@ -103,7 +120,8 @@ async fn remove_silence(
 
     let file_path: String = get_file_path_root(RECORDING_PATH, &path);
     let no_silence_file_path = get_file_path_root(NO_SILENCE_RECORDING_PATH, &path);
-    let file_no_silence = no_silence_file_path.to_owned() + path.4.as_str() + ".ogg";
+    let file_no_silence =
+        no_silence_file_path.to_owned() + "/" + NO_SILENCE_PREFIX + path.4.as_str() + ".ogg";
 
     let idemonpotency = match handle_idempotency_key(&req) {
         Ok(ok) => ok,
@@ -162,12 +180,14 @@ async fn remove_silence(
             }
 
             let file: String = file_path.to_owned() + "/" + path.4.as_str() + ".ogg";
-            let file_no_silence = no_silence_file_path.to_owned() + "/" + path.4.as_str() + ".ogg";
+
             let file_no_silence_clone = file_no_silence.to_owned();
+
+            info!("NO SILENCE FILE PATH: {}", &file_no_silence);
 
             let hashmap_clone = hashmap.clone();
             tokio::spawn(async move {
-                let file_name = path.4.clone();
+                let file_name: String = path.4.clone();
                 let command = match std::process::Command::new("ffmpeg")
                     .args(["-i", &file])
                     .args([
@@ -287,7 +307,7 @@ async fn find_similar(
     return "";
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Debug)]
 struct AudioQuery {
     silence: Option<bool>,
 }
@@ -304,8 +324,14 @@ async fn get_audio(
         if let Some(value) = query_param.silence {
             if value {
                 format!(
-                    "{}{}/{}/{}/{}/{}",
-                    NO_SILENCE_RECORDING_PATH, guild_id, channel_id, year, month, file_name
+                    "{}{}/{}/{}/{}/{}{}",
+                    NO_SILENCE_RECORDING_PATH,
+                    guild_id,
+                    channel_id,
+                    year,
+                    month,
+                    NO_SILENCE_PREFIX,
+                    file_name
                 )
             } else {
                 format!(
@@ -321,6 +347,8 @@ async fn get_audio(
         }
     };
 
+    info!("File path: {}", path);
+
     let res = match NamedFile::open_async(path).await {
         Ok(ok) => ok.into_response(&req),
         Err(_) => return HttpResponse::NotFound().finish(),
@@ -335,22 +363,28 @@ async fn download_audio(
     _req: HttpRequest,
     path: web::Path<(i64, i64, i32, String, String)>,
     clip_duration: web::Query<StartEnd>,
+    is_silence: web::Query<AudioQuery>,
 ) -> Either<HttpResponse, actix_files::NamedFile> {
     let (guild_id, channel_id, year, month, file_name_from_url) = path.into_inner();
 
     info!("{:#?}", clip_duration);
 
     let file_name_without_guild_id = format!("{}/{}/{}", year, month, file_name_from_url);
+    let temp_file = format!(
+        "{}/{}/{}{}",
+        year, month, NO_SILENCE_PREFIX, file_name_from_url
+    );
     if clip_duration.end.is_some() && clip_duration.start.is_some() {
         // Clip
+        let path = format!(
+            "{}{}/{}/{}.ogg",
+            RECORDING_PATH, guild_id, channel_id, &file_name_without_guild_id
+        );
+        info!("is Clip path: {}", path);
         let child = crop_ffmpeg(
             clip_duration.start.unwrap(),
             clip_duration.end.unwrap(),
-            format!(
-                "{}{}/{}/{}",
-                RECORDING_PATH, guild_id, channel_id, &file_name_without_guild_id
-            )
-            .as_str(),
+            path.as_str(),
         )
         .await;
 
@@ -358,7 +392,7 @@ async fn download_audio(
         let clip_name = if clip_duration.name.is_some() {
             clip_duration.name.as_ref().unwrap()
         } else {
-            &file_name_without_guild_id
+            &file_name_from_url
         };
 
         let output = child.wait_with_output().unwrap();
@@ -400,20 +434,33 @@ async fn download_audio(
     } else {
         // Download full file
         info!(
-            "file_paht: {:#?}",
+            "file_path: {:#?} is silence recording? {:#?}",
             format!(
                 "{}{}/{}/{}",
                 RECORDING_PATH, guild_id, channel_id, &file_name_without_guild_id
-            )
+            ),
+            is_silence
         );
-        let file = actix_files::NamedFile::open(
-            format!(
-                "{}{}/{}/{}",
-                RECORDING_PATH, guild_id, channel_id, &file_name_without_guild_id
+
+        let file = if is_silence.silence.is_some() {
+            actix_files::NamedFile::open(
+                format!(
+                    "{}{}/{}/{}",
+                    NO_SILENCE_RECORDING_PATH, guild_id, channel_id, &temp_file
+                )
+                .as_str(),
             )
-            .as_str(),
-        )
-        .unwrap();
+            .unwrap()
+        } else {
+            actix_files::NamedFile::open(
+                format!(
+                    "{}{}/{}/{}",
+                    RECORDING_PATH, guild_id, channel_id, &file_name_without_guild_id
+                )
+                .as_str(),
+            )
+            .unwrap()
+        };
 
         Either::Right(
             file.use_last_modified(true)
