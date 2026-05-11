@@ -23,6 +23,16 @@ use serde_json::json;
 
 type DisplayFromstr = As<DisplayFromStr>;
 
+fn is_valid_recording_file_name(file_name: &str) -> bool {
+    !file_name.is_empty()
+        && !file_name.contains("..")
+        && !file_name.contains('/')
+        && !file_name.contains('\\')
+        && !file_name.contains('\'')
+        && !file_name.contains('"')
+        && !file_name.chars().any(char::is_control)
+}
+
 #[derive(Serialize, Debug, utoipa::ToSchema)]
 pub struct ClipInfo {
     clip_id: String,
@@ -255,6 +265,9 @@ pub async fn create_clip(
         .map(|t| t.user_id)
         .ok_or(AppError::Unauthorized)?;
     let (guild_id, channel_id, year, month, file_name_from_url) = path.into_inner();
+    if !is_valid_recording_file_name(&file_name_from_url) {
+        return Err(AppError::BadRequest("Invalid file name".into()));
+    }
     let src_path = {
         let dir = crate::audio::util::resolve_existing_dir(
             crate::audio::RECORDING_PATH,
@@ -384,4 +397,21 @@ pub async fn delete(
     info!("clip soft-deleted: guild={} clip={}", guild_id, clip_id);
 
     Ok(HttpResponse::Ok().finish())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_valid_recording_file_name;
+
+    #[test]
+    fn validates_recording_file_name_for_clip_creation() {
+        assert!(is_valid_recording_file_name("1712345678-123456789"));
+        assert!(!is_valid_recording_file_name(""));
+        assert!(!is_valid_recording_file_name("../secret"));
+        assert!(!is_valid_recording_file_name("dir/file"));
+        assert!(!is_valid_recording_file_name("dir\\file"));
+        assert!(!is_valid_recording_file_name("bad'name"));
+        assert!(!is_valid_recording_file_name("bad\"name"));
+        assert!(!is_valid_recording_file_name("bad\nname"));
+    }
 }
