@@ -324,6 +324,7 @@ mod tests {
             cookie_domain: "localhost".into(),
             discord_redirect_uri: "http://localhost:8900/api/discord_login".into(),
             grpc_address: "http://[::1]:50052".into(),
+            fbi_agent_registry_secret: None,
             host: "127.0.0.1".into(),
             port: 8900,
             db_max_connections: 20,

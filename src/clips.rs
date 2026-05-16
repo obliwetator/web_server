@@ -12,12 +12,13 @@ use sqlx::{Pool, Postgres};
 use tracing::{error, info};
 
 use crate::proto::jammer::jam_response::JamResponseEnum;
-use crate::proto::jammer::jammer_client::JammerClient;
 use crate::proto::jammer::JamData;
 use crate::{
     audio::CLIPS_PATH,
     auth::{Access, Token},
     errors::AppError,
+    fbi_agent_registry::AgentGrpcRegistry,
+    grpc_client,
 };
 use serde_json::json;
 
@@ -156,7 +157,7 @@ pub enum JamItResponse {
 pub async fn play_clip(
     req: HttpRequest,
     info: web::Json<JamItBody>,
-    client: web::Data<JammerClient<tonic::transport::Channel>>,
+    registry: web::Data<AgentGrpcRegistry>,
 ) -> Result<HttpResponse, AppError> {
     let user_id = req
         .extensions()
@@ -164,7 +165,18 @@ pub async fn play_clip(
         .map(|t| t.user_id)
         .ok_or(AppError::Unauthorized)?;
 
-    let mut client = client.get_ref().clone();
+    let active_address = registry.active_address();
+    let (grpc_address, mut client) = grpc_client::connect_jammer(active_address.clone())
+        .await
+        .map_err(|e| {
+            grpc_client::record_failure("jammer_connect");
+            error!(
+                grpc_address = %active_address,
+                "Failed to connect to Jammer gRPC service: {}",
+                e,
+            );
+            AppError::GrpcError(e.to_string())
+        })?;
 
     let request = tonic::Request::new(JamData {
         clip_name: info.clip_name.clone(),
@@ -173,7 +185,12 @@ pub async fn play_clip(
     });
 
     let response = client.jam_it(request).await.map_err(|e| {
-        error!("Failed to jam_it via GRPC: {}", e);
+        grpc_client::record_failure("jammer_jam_it");
+        error!(
+            grpc_address = %grpc_address,
+            "Failed to jam_it via GRPC: {}",
+            e,
+        );
         AppError::GrpcError(e.to_string())
     })?;
 
