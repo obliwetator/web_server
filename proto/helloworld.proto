@@ -98,8 +98,7 @@ message MetricsResponse {
 	int32 commands_executed = 4;
 	// Voice recording pipeline
 	int32 active_recordings = 5;
-	int32 ffmpeg_spawn_failures = 6;
-	int32 ffmpeg_process_crashes = 7;
+	int32 writer_setup_failures = 6;
 	int64 audio_packets_received = 8;
 	int64 audio_packets_dropped = 9;
 	// Discord gateway health
